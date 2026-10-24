@@ -1218,7 +1218,13 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                                     let grid = p.parser.grid();
                                     let row_cells = grid.get_display_line(grid.cursor_row);
                                     let line_str: String = row_cells.iter().map(|c| if c.c == '\0' { ' ' } else { c.c }).collect();
-                                    let first_word = line_str.split_whitespace().next().unwrap_or("");
+                                    // Bash/zsh komut isteminde ($ veya # veya >) sonrasını al
+                                    let prompt_stripped = if let Some(pos) = line_str.rfind(['$', '#', '>', '❯', '➜']) {
+                                        &line_str[pos + 1..]
+                                    } else {
+                                        &line_str
+                                    };
+                                    let first_word = prompt_stripped.split_whitespace().next().unwrap_or("");
                                     hints::get_command_description(first_word)
                                 } else {
                                     None

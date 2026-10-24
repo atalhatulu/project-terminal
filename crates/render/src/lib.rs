@@ -223,6 +223,7 @@ pub struct TerminalRenderer {
     pub tooltip_buffer: glyphon::Buffer,
     pub palette_buffer: glyphon::Buffer,
     pub palette_footer_buffer: glyphon::Buffer,
+    pub hint_buffer: glyphon::Buffer,
     pub tab_buffers: Vec<glyphon::Buffer>,
     pub pane_buffers: Vec<glyphon::Buffer>,
     pub pane_cached_states: Vec<Option<PaneCachedState>>,
@@ -499,6 +500,10 @@ impl TerminalRenderer {
             &mut font_system,
             Metrics::new((font_size * 0.8).round().max(9.0), 22.0),
         );
+        let hint_buffer = glyphon::Buffer::new(
+            &mut font_system,
+            Metrics::new(font_size, cell_height),
+        );
 
         // 2. Arka Plan Dikdörtgen (Quad) Shader ve Pipeline Kurulumu
         let bg_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -694,6 +699,7 @@ impl TerminalRenderer {
             tooltip_buffer,
             palette_buffer,
             palette_footer_buffer,
+            hint_buffer,
             tab_buffers: Vec::new(),
             pane_buffers: Vec::new(),
             pane_cached_states: Vec::new(),
@@ -788,6 +794,8 @@ impl TerminalRenderer {
             glyphon::Buffer::new(&mut self.font_system, glyphon::Metrics::new(font_size * 0.9, self.cell_height));
         self.palette_footer_buffer =
             glyphon::Buffer::new(&mut self.font_system, glyphon::Metrics::new((font_size * 0.8).round().max(9.0), 22.0));
+        self.hint_buffer =
+            glyphon::Buffer::new(&mut self.font_system, glyphon::Metrics::new(font_size, self.cell_height));
         self.tab_buffers.clear();
         self.pane_buffers.clear();
         self.pane_cached_states.clear();
@@ -875,6 +883,7 @@ impl TerminalRenderer {
 
         let mut pane_text_areas = Vec::new();
         let mut search_overlay = None;
+        let mut hint_overlay = None;
 
         for (p_idx, pane) in panes.iter().enumerate() {
             let grid = pane.grid;
@@ -1107,17 +1116,6 @@ impl TerminalRenderer {
                         }
                     }
 
-                    // Hayalet İpucu (Ghost Hint) - İmlecin bulunduğu aktif komut satırında açıklama basma
-                    if r == grid.cursor_row && pane.is_active && grid.scroll_offset == 0 {
-                        if let Some(hint_text) = pane.ghost_hint {
-                            let hint_attrs = glyphon::Attrs::new()
-                                .family(glyphon::Family::Name(&self.font_family))
-                                .style(glyphon::Style::Italic)
-                                .color(glyphon::Color::rgb(110, 115, 140));
-                            spans.push((format!("  ({})", hint_text), hint_attrs));
-                        }
-                    }
-
                     spans.push((
                         "\n".to_string(),
                         glyphon::Attrs::new()
@@ -1230,6 +1228,48 @@ impl TerminalRenderer {
                     );
                     self.search_buffer.shape_until_scroll(&mut self.font_system, false);
                     search_overlay = Some((bar_x, bar_y, bar_width, bar_height));
+                }
+            }
+
+            // Aktif panel komut açıklaması rozeti (Floating Ghost Command Hint)
+            if pane.is_active && grid.scroll_offset == 0 {
+                if let Some(hint_text) = pane.ghost_hint {
+                    let formatted_hint = format!(" {} ", hint_text);
+                    let h_x = pane_px + (grid.cursor_col + 2) as f32 * self.cell_width;
+                    let h_y = pane_py + grid.cursor_row as f32 * self.cell_height;
+                    let max_w = (pane_pw - (h_x - pane_px)).max(0.0);
+                    let h_w = (formatted_hint.chars().count() as f32 * self.cell_width).min(max_w);
+                    let h_h = self.cell_height;
+
+                    if h_w > 20.0 {
+                        // Şık, yarı saydam koyu lacivert/mor rozet arka planı ve ince kenarlık
+                        push_quad(
+                            &mut bg_vertices,
+                            h_x,
+                            h_y,
+                            h_w,
+                            h_h,
+                            [25.0 / 255.0, 30.0 / 255.0, 48.0 / 255.0, 0.92],
+                        );
+                        let border_col = [80.0 / 255.0, 100.0 / 255.0, 150.0 / 255.0, 0.7];
+                        push_quad(&mut bg_vertices, h_x, h_y, h_w, 1.0, border_col);
+                        push_quad(&mut bg_vertices, h_x, h_y + h_h - 1.0, h_w, 1.0, border_col);
+                        push_quad(&mut bg_vertices, h_x, h_y, 1.0, h_h, border_col);
+                        push_quad(&mut bg_vertices, h_x + h_w - 1.0, h_y, 1.0, h_h, border_col);
+
+                        self.hint_buffer.set_text(
+                            &mut self.font_system,
+                            &formatted_hint,
+                            glyphon::Attrs::new()
+                                .family(glyphon::Family::Name(&self.font_family))
+                                .style(glyphon::Style::Italic)
+                                .weight(glyphon::Weight::MEDIUM)
+                                .color(glyphon::Color::rgb(180, 195, 235)),
+                            glyphon::Shaping::Advanced,
+                        );
+                        self.hint_buffer.shape_until_scroll(&mut self.font_system, false);
+                        hint_overlay = Some((h_x, h_y, h_w, h_h));
+                    }
                 }
             }
         }
@@ -1815,6 +1855,23 @@ impl TerminalRenderer {
                     bottom: (by + bh) as i32,
                 },
                 default_color: glyphon::Color::rgb(226, 228, 234),
+                custom_glyphs: &[],
+            });
+        }
+
+        if let Some((hx, hy, hw, hh)) = hint_overlay {
+            text_areas.push(TextArea {
+                buffer: &self.hint_buffer,
+                left: hx,
+                top: hy,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: hx as i32,
+                    top: hy as i32,
+                    right: (hx + hw) as i32,
+                    bottom: (hy + hh) as i32,
+                },
+                default_color: glyphon::Color::rgb(180, 195, 235),
                 custom_glyphs: &[],
             });
         }
