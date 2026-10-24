@@ -1245,8 +1245,15 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                                     } else {
                                         &line_str
                                     };
-                                    let first_word = prompt_stripped.split_whitespace().next().unwrap_or("");
-                                    hints::get_command_description(first_word)
+                                    let mut words = prompt_stripped.split_whitespace();
+                                    let first_word = words.next().unwrap_or("");
+                                    let has_more_arguments = words.next().is_some();
+                                    // Sadece komut henüz parametresizken veya argümansızken ipucu ver
+                                    if !has_more_arguments && !first_word.is_empty() {
+                                        hints::get_command_description(first_word)
+                                    } else {
+                                        None
+                                    }
                                 } else {
                                     None
                                 };

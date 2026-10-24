@@ -1079,6 +1079,9 @@ impl TerminalRenderer {
                         // 2. Yazı rengi ve stil belirleme
                         let text_color = if is_selected {
                             glyphon::Color::rgb(255, 255, 255)
+                        } else if is_cursor && grid.cursor_shape == CursorShape::Block {
+                            // Blok imlecin altındaki karakter net okunsun diye koyu renge çevir
+                            glyphon::Color::rgb(15, 18, 26)
                         } else {
                             glyphon::Color::rgb(eff_fg.0, eff_fg.1, eff_fg.2)
                         };
@@ -1183,26 +1186,15 @@ impl TerminalRenderer {
                         let is_eye_blinking = blink_cycle > 3300;
 
                         let eye_color = [15.0 / 255.0, 18.0 / 255.0, 26.0 / 255.0, 1.0];
-                        let eye_w = (self.cell_width * 0.18).round().max(1.5);
-                        let eye_h = if is_eye_blinking {
-                            1.0 // Kırpıldığında ince yatay çizgi
-                        } else {
-                            (self.cell_height * 0.22).round().max(2.5) // Açık göz
-                        };
+                        let eye_w = 2.0;
+                        let eye_h = if is_eye_blinking { 1.0 } else { 3.0 };
 
-                        let left_eye_x = (cx + self.cell_width * 0.25).round();
-                        let right_eye_x = (cx + self.cell_width * 0.65).round();
-                        let eye_y = (cy + self.cell_height * 0.35).round();
+                        let left_eye_x = (cx + self.cell_width * 0.28).round();
+                        let right_eye_x = (cx + self.cell_width * 0.62).round();
+                        let eye_y = (cy + self.cell_height * 0.38).round();
 
                         push_quad(&mut bg_vertices, left_eye_x, eye_y, eye_w, eye_h, eye_color);
                         push_quad(&mut bg_vertices, right_eye_x, eye_y, eye_w, eye_h, eye_color);
-
-                        // Gözler açıkken içlerinde küçük beyaz parıltı (Canlılık hissi)
-                        if !is_eye_blinking && eye_w >= 2.0 && eye_h >= 3.0 {
-                            let shine_color = [255.0 / 255.0, 255.0 / 255.0, 255.0 / 255.0, 0.9];
-                            push_quad(&mut bg_vertices, left_eye_x, eye_y, 1.0, 1.0, shine_color);
-                            push_quad(&mut bg_vertices, right_eye_x, eye_y, 1.0, 1.0, shine_color);
-                        }
                     }
                     CursorShape::Beam => {
                         push_quad(
