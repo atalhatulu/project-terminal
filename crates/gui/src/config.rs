@@ -53,7 +53,6 @@ pub struct Config {
     pub keybindings: Option<KeybindingsConfig>,
     pub shell: Option<String>,
     pub scrollback_lines: Option<usize>,
-    pub show_hints: Option<bool>,
     pub effects: Option<EffectsConfig>,
 }
 

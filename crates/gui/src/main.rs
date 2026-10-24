@@ -1,5 +1,4 @@
 mod config;
-mod hints;
 mod layout;
 mod theme;
 
@@ -122,12 +121,6 @@ const ALL_COMMANDS: &[CommandPaletteItem] = &[
         title: "Ayarlar Dosyasını Aç (config.toml)",
         shortcut: "config.toml",
         category: "Ayarlar",
-    },
-    CommandPaletteItem {
-        id: "toggle_hints",
-        title: "Komut İpuçlarını Aç / Kapat",
-        shortcut: "İpucu",
-        category: "Terminal",
     },
     CommandPaletteItem {
         id: "toggle_typewriter",
@@ -497,10 +490,6 @@ opacity = 0.95
             }
             "open_config" => {
                 self.open_settings();
-            }
-            "toggle_hints" => {
-                let current = self.config.show_hints.unwrap_or(true);
-                self.config.show_hints = Some(!current);
             }
             "toggle_typewriter" => {
                 let current = self.config.effects.as_ref().and_then(|e| e.typewriter).unwrap_or(false);
@@ -1230,37 +1219,12 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
 
                 if let (Some(renderer), Some(tab)) = (&mut self.renderer, self.tabs.get(active_idx)) {
                     let geoms = tab.geometries(cols, rows);
-                    let show_hints = self.config.show_hints.unwrap_or(true);
-                    let is_typing_paused = self.last_key_time.elapsed().as_millis() >= 250;
 
                     let draw_panes: Vec<PaneDrawInfo> = geoms
                         .iter()
                         .filter_map(|g| {
                             tab.panes.iter().find(|p| p.id == g.pane_id).map(|p| {
                                 let is_active = p.id == tab.active_pane_id;
-                                let ghost_hint = if is_active && show_hints && is_typing_paused {
-                                    let grid = p.parser.grid();
-                                    let row_cells = grid.get_display_line(grid.cursor_row);
-                                    let line_str: String = row_cells.iter().map(|c| if c.c == '\0' { ' ' } else { c.c }).collect();
-                                    // Bash/zsh komut isteminde ($ veya # veya >) sonrasını al
-                                    let prompt_stripped = if let Some((pos, ch)) = line_str.char_indices().rfind(|&(_, c)| matches!(c, '$' | '#' | '>' | '❯' | '➜' | ':')) {
-                                        &line_str[pos + ch.len_utf8()..]
-                                    } else {
-                                        &line_str
-                                    };
-                                    let mut words = prompt_stripped.split_whitespace();
-                                    let first_word = words.next().unwrap_or("");
-                                    let has_more_arguments = words.next().is_some();
-                                    // Sadece komut henüz parametresizken veya argümansızken ipucu ver
-                                    if !has_more_arguments && !first_word.is_empty() {
-                                        hints::get_command_description(first_word)
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
-
                                 PaneDrawInfo {
                                     id: p.id,
                                     grid: p.parser.grid(),
@@ -1269,7 +1233,7 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                                     cols: g.cols,
                                     rows: g.rows,
                                     is_active,
-                                    ghost_hint,
+                                    ghost_hint: None,
                                 }
                             })
                         })

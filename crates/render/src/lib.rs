@@ -250,10 +250,6 @@ pub struct TerminalRenderer {
     bg_vertex_buffer: wgpu::Buffer,
     bg_vertex_capacity: usize,
 
-    // Ön Plan Rozet / İmleç (Quad) Render Hattı
-    fg_vertex_buffer: wgpu::Buffer,
-    fg_vertex_capacity: usize,
-
     // Sixel Görsel Render Hattı
     image_pipeline: wgpu::RenderPipeline,
     image_bind_group_layout: wgpu::BindGroupLayout,
@@ -598,12 +594,6 @@ impl TerminalRenderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let fg_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Foreground Vertex Buffer"),
-            size: (initial_capacity * std::mem::size_of::<BackgroundVertex>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
         // 3. Sixel Görsel Pipeline ve Sampler Kurulumu
         let image_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -733,8 +723,6 @@ impl TerminalRenderer {
             bg_uniform_buffer,
             bg_vertex_buffer,
             bg_vertex_capacity: initial_capacity,
-            fg_vertex_buffer,
-            fg_vertex_capacity: initial_capacity,
             image_pipeline,
             image_bind_group_layout,
             image_sampler,
@@ -882,7 +870,6 @@ impl TerminalRenderer {
 
         // 1. Arka Plan Dikdörtgenlerini (Quad) Oluştur
         let mut bg_vertices: Vec<BackgroundVertex> = Vec::new();
-        let mut fg_vertices: Vec<BackgroundVertex> = Vec::new();
 
         while self.pane_buffers.len() < panes.len() {
             self.pane_buffers.push(glyphon::Buffer::new(
@@ -896,7 +883,6 @@ impl TerminalRenderer {
 
         let mut pane_text_areas = Vec::new();
         let mut search_overlay = None;
-        let mut hint_overlay = None;
 
         for (p_idx, pane) in panes.iter().enumerate() {
             let grid = pane.grid;
@@ -1261,48 +1247,6 @@ impl TerminalRenderer {
                     );
                     self.search_buffer.shape_until_scroll(&mut self.font_system, false);
                     search_overlay = Some((bar_x, bar_y, bar_width, bar_height));
-                }
-            }
-
-            // Aktif panel komut açıklaması rozeti (Floating Ghost Command Hint)
-            if pane.is_active && grid.scroll_offset == 0 {
-                if let Some(hint_text) = pane.ghost_hint {
-                    let formatted_hint = format!(" • {} ", hint_text);
-                    let h_x = pane_px + (grid.cursor_col + 1) as f32 * self.cell_width + 8.0;
-                    let h_y = pane_py + grid.cursor_row as f32 * self.cell_height + 2.0;
-                    let max_w = (pane_pw - (h_x - pane_px)).max(0.0);
-                    let h_w = (formatted_hint.chars().count() as f32 * self.cell_width * 0.9).min(max_w);
-                    let h_h = self.cell_height - 4.0;
-
-                    if h_w > 16.0 {
-                        // Tam opak, şık koyu lacivert/mor rozet ve belirgin kenarlık
-                        push_quad(
-                            &mut fg_vertices,
-                            h_x,
-                            h_y,
-                            h_w,
-                            h_h,
-                            [22.0 / 255.0, 26.0 / 255.0, 38.0 / 255.0, 1.0],
-                        );
-                        let border_col = [90.0 / 255.0, 115.0 / 255.0, 175.0 / 255.0, 0.9];
-                        push_quad(&mut fg_vertices, h_x, h_y, h_w, 1.0, border_col);
-                        push_quad(&mut fg_vertices, h_x, h_y + h_h - 1.0, h_w, 1.0, border_col);
-                        push_quad(&mut fg_vertices, h_x, h_y, 1.0, h_h, border_col);
-                        push_quad(&mut fg_vertices, h_x + h_w - 1.0, h_y, 1.0, h_h, border_col);
-
-                        self.hint_buffer.set_text(
-                            &mut self.font_system,
-                            &formatted_hint,
-                            glyphon::Attrs::new()
-                                .family(glyphon::Family::Name(&self.font_family))
-                                .style(glyphon::Style::Italic)
-                                .weight(glyphon::Weight::MEDIUM)
-                                .color(glyphon::Color::rgb(180, 195, 235)),
-                            glyphon::Shaping::Advanced,
-                        );
-                        self.hint_buffer.shape_until_scroll(&mut self.font_system, false);
-                        hint_overlay = Some((h_x + 3.0, h_y - 1.0, h_w, h_h + 2.0));
-                    }
                 }
             }
         }
@@ -1829,24 +1773,6 @@ impl TerminalRenderer {
             );
         }
 
-        // Ön plan (rozet/ipucu) vertex buffer'ına yaz
-        if !fg_vertices.is_empty() {
-            if fg_vertices.len() > self.fg_vertex_capacity {
-                self.fg_vertex_capacity = fg_vertices.len() * 2;
-                self.fg_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Foreground Vertex Buffer (Expanded)"),
-                    size: (self.fg_vertex_capacity * std::mem::size_of::<BackgroundVertex>()) as u64,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-            }
-            self.queue.write_buffer(
-                &self.fg_vertex_buffer,
-                0,
-                bytemuck::cast_slice(&fg_vertices),
-            );
-        }
-
         let mut text_areas = Vec::new();
         for (p_idx, px, py, pw, ph) in pane_text_areas {
             text_areas.push(TextArea {
@@ -1906,23 +1832,6 @@ impl TerminalRenderer {
                     bottom: (by + bh) as i32,
                 },
                 default_color: glyphon::Color::rgb(226, 228, 234),
-                custom_glyphs: &[],
-            });
-        }
-
-        if let Some((hx, hy, hw, hh)) = hint_overlay {
-            text_areas.push(TextArea {
-                buffer: &self.hint_buffer,
-                left: hx,
-                top: hy,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: hx as i32,
-                    top: hy as i32,
-                    right: (hx + hw) as i32,
-                    bottom: (hy + hh) as i32,
-                },
-                default_color: glyphon::Color::rgb(180, 195, 235),
                 custom_glyphs: &[],
             });
         }
@@ -2115,14 +2024,6 @@ impl TerminalRenderer {
             // Adım 2: Metin Gliflerini Arka Planın Üzerine Çiz
             self.text_renderer
                 .render(&self.text_atlas, &self.viewport, &mut pass)?;
-
-            // Adım 3: Ön Plan Rozetlerini (Komut İpucu Kapsülü) Çiz (Metinlerin üstünde örtüşmesiz)
-            if !fg_vertices.is_empty() {
-                pass.set_pipeline(&self.bg_pipeline);
-                pass.set_bind_group(0, &self.bg_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.fg_vertex_buffer.slice(..));
-                pass.draw(0..fg_vertices.len() as u32, 0..1);
-            }
         }
 
         self.queue.submit(Some(encoder.finish()));
