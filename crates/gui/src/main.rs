@@ -268,6 +268,7 @@ struct TerminalApp {
     command_palette_open: bool,
     command_palette_query: String,
     command_palette_selected: usize,
+    last_key_time: std::time::Instant,
 }
 
 impl TerminalApp {
@@ -309,6 +310,7 @@ impl TerminalApp {
             command_palette_open: false,
             command_palette_query: String::new(),
             command_palette_selected: 0,
+            last_key_time: std::time::Instant::now(),
         }
     }
 
@@ -1226,13 +1228,14 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                 if let (Some(renderer), Some(tab)) = (&mut self.renderer, self.tabs.get(active_idx)) {
                     let geoms = tab.geometries(cols, rows);
                     let show_hints = self.config.show_hints.unwrap_or(true);
+                    let is_typing_paused = self.last_key_time.elapsed().as_millis() >= 250;
 
                     let draw_panes: Vec<PaneDrawInfo> = geoms
                         .iter()
                         .filter_map(|g| {
                             tab.panes.iter().find(|p| p.id == g.pane_id).map(|p| {
                                 let is_active = p.id == tab.active_pane_id;
-                                let ghost_hint = if is_active && show_hints {
+                                let ghost_hint = if is_active && show_hints && is_typing_paused {
                                     let grid = p.parser.grid();
                                     let row_cells = grid.get_display_line(grid.cursor_row);
                                     let line_str: String = row_cells.iter().map(|c| if c.c == '\0' { ' ' } else { c.c }).collect();
@@ -1309,6 +1312,8 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                 let is_ctrl = self.modifiers.control_key();
                 let is_alt = self.modifiers.alt_key();
                 let is_shift = self.modifiers.shift_key();
+
+                self.last_key_time = std::time::Instant::now();
 
                 // 0. Ctrl + Shift + P ile Komut Paletini Aç / Kapat
                 if is_ctrl && is_shift && matches!(&logical_key, Key::Character(c) if c.eq_ignore_ascii_case("p")) {

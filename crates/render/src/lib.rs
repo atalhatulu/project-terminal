@@ -1234,24 +1234,24 @@ impl TerminalRenderer {
             // Aktif panel komut açıklaması rozeti (Floating Ghost Command Hint)
             if pane.is_active && grid.scroll_offset == 0 {
                 if let Some(hint_text) = pane.ghost_hint {
-                    let formatted_hint = format!(" {} ", hint_text);
-                    let h_x = pane_px + (grid.cursor_col + 2) as f32 * self.cell_width;
-                    let h_y = pane_py + grid.cursor_row as f32 * self.cell_height;
+                    let formatted_hint = format!(" • {} ", hint_text);
+                    let h_x = pane_px + (grid.cursor_col + 1) as f32 * self.cell_width + 4.0;
+                    let h_y = pane_py + grid.cursor_row as f32 * self.cell_height + 2.0;
                     let max_w = (pane_pw - (h_x - pane_px)).max(0.0);
-                    let h_w = (formatted_hint.chars().count() as f32 * self.cell_width).min(max_w);
-                    let h_h = self.cell_height;
+                    let h_w = (formatted_hint.chars().count() as f32 * self.cell_width * 0.9).min(max_w);
+                    let h_h = self.cell_height - 4.0;
 
-                    if h_w > 20.0 {
-                        // Şık, yarı saydam koyu lacivert/mor rozet arka planı ve ince kenarlık
+                    if h_w > 16.0 {
+                        // Minimalist, modern ve hafif şeffaf kapsül tasarımı
                         push_quad(
                             &mut bg_vertices,
                             h_x,
                             h_y,
                             h_w,
                             h_h,
-                            [25.0 / 255.0, 30.0 / 255.0, 48.0 / 255.0, 0.92],
+                            [30.0 / 255.0, 34.0 / 255.0, 48.0 / 255.0, 0.75],
                         );
-                        let border_col = [80.0 / 255.0, 100.0 / 255.0, 150.0 / 255.0, 0.7];
+                        let border_col = [70.0 / 255.0, 85.0 / 255.0, 130.0 / 255.0, 0.5];
                         push_quad(&mut bg_vertices, h_x, h_y, h_w, 1.0, border_col);
                         push_quad(&mut bg_vertices, h_x, h_y + h_h - 1.0, h_w, 1.0, border_col);
                         push_quad(&mut bg_vertices, h_x, h_y, 1.0, h_h, border_col);
@@ -1264,11 +1264,11 @@ impl TerminalRenderer {
                                 .family(glyphon::Family::Name(&self.font_family))
                                 .style(glyphon::Style::Italic)
                                 .weight(glyphon::Weight::MEDIUM)
-                                .color(glyphon::Color::rgb(180, 195, 235)),
+                                .color(glyphon::Color::rgb(145, 160, 205)),
                             glyphon::Shaping::Advanced,
                         );
                         self.hint_buffer.shape_until_scroll(&mut self.font_system, false);
-                        hint_overlay = Some((h_x, h_y, h_w, h_h));
+                        hint_overlay = Some((h_x + 2.0, h_y - 1.0, h_w, h_h + 2.0));
                     }
                 }
             }
