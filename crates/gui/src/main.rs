@@ -1219,8 +1219,8 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                                     let row_cells = grid.get_display_line(grid.cursor_row);
                                     let line_str: String = row_cells.iter().map(|c| if c.c == '\0' { ' ' } else { c.c }).collect();
                                     // Bash/zsh komut isteminde ($ veya # veya >) sonrasını al
-                                    let prompt_stripped = if let Some(pos) = line_str.rfind(['$', '#', '>', '❯', '➜']) {
-                                        &line_str[pos + 1..]
+                                    let prompt_stripped = if let Some((pos, ch)) = line_str.char_indices().rfind(|&(_, c)| matches!(c, '$' | '#' | '>' | '❯' | '➜' | ':')) {
+                                        &line_str[pos + ch.len_utf8()..]
                                     } else {
                                         &line_str
                                     };
