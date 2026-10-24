@@ -924,13 +924,13 @@ impl TerminalRenderer {
                         pos[1] = target_cy;
                         (target_cx, target_cy)
                     } else {
-                        let decay = 35.0; // iOS akıcı yaylanma katsayısı
+                        let decay = 45.0; // Daha hızlı, tok ve net oturma
                         let factor = (1.0 - (-decay * dt).exp()).clamp(0.0, 1.0);
                         pos[0] += (target_cx - pos[0]) * factor;
                         pos[1] += (target_cy - pos[1]) * factor;
 
                         let dist_sq = (target_cx - pos[0]).powi(2) + (target_cy - pos[1]).powi(2);
-                        if dist_sq > 0.08 {
+                        if dist_sq > 0.5 {
                             self.is_animating = true;
                         } else {
                             pos[0] = target_cx;
@@ -1154,6 +1154,7 @@ impl TerminalRenderer {
             if let Some((cx, cy, shape)) = smooth_cursor_quad {
                 match shape {
                     CursorShape::Block => {
+                        // Ana blok gövdesi (hafif yuvarlak köşeli etki veren dolgun gövde)
                         push_quad(
                             &mut bg_vertices,
                             cx,
@@ -1162,6 +1163,33 @@ impl TerminalRenderer {
                             self.cell_height,
                             cursor_color,
                         );
+
+                        // Maskot Pet Gözleri: Blok imlecin içinde iki sevimli piksel göz
+                        // Periyodik göz kırpma (Blink: her ~3.5 saniyede bir 180ms kırpma)
+                        let blink_cycle = now_ms % 3500;
+                        let is_eye_blinking = blink_cycle > 3300;
+
+                        let eye_color = [15.0 / 255.0, 18.0 / 255.0, 26.0 / 255.0, 1.0];
+                        let eye_w = (self.cell_width * 0.18).round().max(1.5);
+                        let eye_h = if is_eye_blinking {
+                            1.0 // Kırpıldığında ince yatay çizgi
+                        } else {
+                            (self.cell_height * 0.22).round().max(2.5) // Açık göz
+                        };
+
+                        let left_eye_x = (cx + self.cell_width * 0.25).round();
+                        let right_eye_x = (cx + self.cell_width * 0.65).round();
+                        let eye_y = (cy + self.cell_height * 0.35).round();
+
+                        push_quad(&mut bg_vertices, left_eye_x, eye_y, eye_w, eye_h, eye_color);
+                        push_quad(&mut bg_vertices, right_eye_x, eye_y, eye_w, eye_h, eye_color);
+
+                        // Gözler açıkken içlerinde küçük beyaz parıltı (Canlılık hissi)
+                        if !is_eye_blinking && eye_w >= 2.0 && eye_h >= 3.0 {
+                            let shine_color = [255.0 / 255.0, 255.0 / 255.0, 255.0 / 255.0, 0.9];
+                            push_quad(&mut bg_vertices, left_eye_x, eye_y, 1.0, 1.0, shine_color);
+                            push_quad(&mut bg_vertices, right_eye_x, eye_y, 1.0, 1.0, shine_color);
+                        }
                     }
                     CursorShape::Beam => {
                         push_quad(
