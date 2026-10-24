@@ -1013,11 +1013,15 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
 
                 for (tab_idx, tab) in self.tabs.iter_mut().enumerate() {
                     if let Some(pane) = tab.pane_mut(pane_id) {
-                        // Eğer daktilo modu açıksa ve çıktı çok devasa değilse (< 2048 bayt) tampona at
-                        if is_typewriter && bytes.len() <= 2048 && pane.parser.grid().cursor_visible {
+                        // Eğer daktilo modu açıksa kuyruğa ekle, devasa çıktılarda (16KB+) doğrudan işlet
+                        if is_typewriter && pane.pending_typewriter_bytes.len() < 16384 && pane.parser.grid().cursor_visible {
                             pane.pending_typewriter_bytes.extend(bytes);
                         } else {
-                            // Büyük çıktılarda gecikmesiz doğrudan işlet
+                            // Tampon çok şişmişse veya daktilo kapalıysa doğrudan işlet
+                            if !pane.pending_typewriter_bytes.is_empty() {
+                                let drained: Vec<u8> = pane.pending_typewriter_bytes.drain(..).collect();
+                                pane.parser.process_bytes(&drained);
+                            }
                             pane.parser.process_bytes(&bytes);
                         }
 
@@ -1060,9 +1064,23 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                 let mut needs_redraw = false;
                 for tab in &mut self.tabs {
                     for pane in &mut tab.panes {
-                        if !pane.pending_typewriter_bytes.is_empty() {
-                            // Her tikte 3-6 karakterlik bloklar halinde tüketerek daktilo hissi ver
-                            let count = pane.pending_typewriter_bytes.len().min(4);
+                        let pending_len = pane.pending_typewriter_bytes.len();
+                        if pending_len > 0 {
+                            // Dinamik adaptif hız hesabı:
+                            // Toplam animasyonun maksimum ~150-200ms civarında tamamlanması hedeflenir.
+                            // - Kısa çıktılarda (örneğin < 60 bayt): 3-5 bayt ile daktilo ritmi.
+                            // - Orta çıktılarda (100 - 500 bayt): 20 - 40 baytlık akıcı kayma.
+                            // - Uzun çıktılarda (ls / tree, 1000+ bayt): 100 - 250 baytlık yüksek hızlı akış.
+                            let count = if pending_len > 1000 {
+                                (pending_len / 10).clamp(120, 512)
+                            } else if pending_len > 250 {
+                                (pending_len / 12).clamp(35, 120)
+                            } else if pending_len > 60 {
+                                12.min(pending_len)
+                            } else {
+                                4.min(pending_len)
+                            };
+
                             let mut chunk = Vec::with_capacity(count);
                             for _ in 0..count {
                                 if let Some(b) = pane.pending_typewriter_bytes.pop_front() {
