@@ -194,6 +194,7 @@ pub struct PaneDrawInfo<'a> {
     pub cols: usize,
     pub rows: usize,
     pub is_active: bool,
+    pub ghost_hint: Option<&'a str>,
 }
 
 #[derive(Clone, Debug)]
@@ -1105,6 +1106,18 @@ impl TerminalRenderer {
                             spans.push((current_span_text, attrs));
                         }
                     }
+
+                    // Hayalet İpucu (Ghost Hint) - İmlecin bulunduğu aktif komut satırında açıklama basma
+                    if r == grid.cursor_row && pane.is_active && grid.scroll_offset == 0 {
+                        if let Some(hint_text) = pane.ghost_hint {
+                            let hint_attrs = glyphon::Attrs::new()
+                                .family(glyphon::Family::Name(&self.font_family))
+                                .style(glyphon::Style::Italic)
+                                .color(glyphon::Color::rgb(110, 115, 140));
+                            spans.push((format!("  ({})", hint_text), hint_attrs));
+                        }
+                    }
+
                     spans.push((
                         "\n".to_string(),
                         glyphon::Attrs::new()
@@ -2013,6 +2026,7 @@ impl TerminalRenderer {
                 cols: grid.cols,
                 rows: grid.rows,
                 is_active: true,
+                ghost_hint: None,
             }],
             tabs,
             None,

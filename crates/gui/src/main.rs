@@ -1,4 +1,5 @@
 mod config;
+mod hints;
 mod layout;
 mod theme;
 
@@ -122,6 +123,18 @@ const ALL_COMMANDS: &[CommandPaletteItem] = &[
         shortcut: "config.toml",
         category: "Ayarlar",
     },
+    CommandPaletteItem {
+        id: "toggle_hints",
+        title: "Komut İpuçlarını Aç / Kapat",
+        shortcut: "İpucu",
+        category: "Terminal",
+    },
+    CommandPaletteItem {
+        id: "toggle_typewriter",
+        title: "Daktilo Animasyonunu Aç / Kapat",
+        shortcut: "Daktilo",
+        category: "Efektler",
+    },
 ];
 
 pub fn filter_commands_by_query(query: &str) -> Vec<CommandPaletteItem> {
@@ -159,6 +172,7 @@ pub enum AppEvent {
     PtyData { pane_id: usize, bytes: Vec<u8> },
     PtyExit { pane_id: usize },
     BlinkTick,
+    TypewriterTick,
     ConfigReloaded(Config),
 }
 
@@ -180,6 +194,7 @@ struct Pane {
     pty: Pty,
     title: String,
     is_held: bool,
+    pending_typewriter_bytes: std::collections::VecDeque<u8>,
 }
 
 struct Tab {
@@ -481,6 +496,18 @@ opacity = 0.95
             "open_config" => {
                 self.open_settings();
             }
+            "toggle_hints" => {
+                let current = self.config.show_hints.unwrap_or(true);
+                self.config.show_hints = Some(!current);
+            }
+            "toggle_typewriter" => {
+                let current = self.config.effects.as_ref().and_then(|e| e.typewriter).unwrap_or(false);
+                let delay = self.config.effects.as_ref().and_then(|e| e.typewriter_delay_ms).unwrap_or(15);
+                self.config.effects = Some(config::EffectsConfig {
+                    typewriter: Some(!current),
+                    typewriter_delay_ms: Some(delay),
+                });
+            }
             _ => {}
         }
         if let Some(win) = &self.window {
@@ -606,6 +633,7 @@ opacity = 0.95
             pty,
             title: "Project Terminal".to_string(),
             is_held: false,
+            pending_typewriter_bytes: std::collections::VecDeque::new(),
         })
     }
 
@@ -938,6 +966,17 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                 }
             });
 
+            // Daktilo Animasyon Zamanlayıcısı (Typewriter Tick)
+            let typewriter_proxy = self.event_loop_proxy.clone();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                    if typewriter_proxy.send_event(AppEvent::TypewriterTick).is_err() {
+                        break;
+                    }
+                }
+            });
+
             // Canlı Yapılandırma Dosyası İzleyici (Config Live Reload)
             if let Some(cfg_path) = Config::config_path() {
                 let config_proxy = self.event_loop_proxy.clone();
@@ -970,9 +1009,17 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
             AppEvent::PtyData { pane_id, bytes } => {
+                let is_typewriter = self.config.effects.as_ref().and_then(|e| e.typewriter).unwrap_or(false);
+
                 for (tab_idx, tab) in self.tabs.iter_mut().enumerate() {
                     if let Some(pane) = tab.pane_mut(pane_id) {
-                        pane.parser.process_bytes(&bytes);
+                        // Eğer daktilo modu açıksa ve çıktı çok devasa değilse (< 2048 bayt) tampona at
+                        if is_typewriter && bytes.len() <= 2048 && pane.parser.grid().cursor_visible {
+                            pane.pending_typewriter_bytes.extend(bytes);
+                        } else {
+                            // Büyük çıktılarda gecikmesiz doğrudan işlet
+                            pane.parser.process_bytes(&bytes);
+                        }
 
                         if let Some(text) = pane.parser.clipboard_store.take() {
                             if let Ok(mut cb) = arboard::Clipboard::new() {
@@ -1006,6 +1053,30 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                             }
                         }
                         break;
+                    }
+                }
+            }
+            AppEvent::TypewriterTick => {
+                let mut needs_redraw = false;
+                for tab in &mut self.tabs {
+                    for pane in &mut tab.panes {
+                        if !pane.pending_typewriter_bytes.is_empty() {
+                            // Her tikte 3-6 karakterlik bloklar halinde tüketerek daktilo hissi ver
+                            let count = pane.pending_typewriter_bytes.len().min(4);
+                            let mut chunk = Vec::with_capacity(count);
+                            for _ in 0..count {
+                                if let Some(b) = pane.pending_typewriter_bytes.pop_front() {
+                                    chunk.push(b);
+                                }
+                            }
+                            pane.parser.process_bytes(&chunk);
+                            needs_redraw = true;
+                        }
+                    }
+                }
+                if needs_redraw {
+                    if let Some(win) = &self.window {
+                        win.request_redraw();
                     }
                 }
             }
@@ -1136,10 +1207,23 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
 
                 if let (Some(renderer), Some(tab)) = (&mut self.renderer, self.tabs.get(active_idx)) {
                     let geoms = tab.geometries(cols, rows);
+                    let show_hints = self.config.show_hints.unwrap_or(true);
+
                     let draw_panes: Vec<PaneDrawInfo> = geoms
                         .iter()
                         .filter_map(|g| {
                             tab.panes.iter().find(|p| p.id == g.pane_id).map(|p| {
+                                let is_active = p.id == tab.active_pane_id;
+                                let ghost_hint = if is_active && show_hints {
+                                    let grid = p.parser.grid();
+                                    let row_cells = grid.get_display_line(grid.cursor_row);
+                                    let line_str: String = row_cells.iter().map(|c| if c.c == '\0' { ' ' } else { c.c }).collect();
+                                    let first_word = line_str.split_whitespace().next().unwrap_or("");
+                                    hints::get_command_description(first_word)
+                                } else {
+                                    None
+                                };
+
                                 PaneDrawInfo {
                                     id: p.id,
                                     grid: p.parser.grid(),
@@ -1147,7 +1231,8 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                                     row_offset: g.row_offset,
                                     cols: g.cols,
                                     rows: g.rows,
-                                    is_active: p.id == tab.active_pane_id,
+                                    is_active,
+                                    ghost_hint,
                                 }
                             })
                         })

@@ -38,6 +38,12 @@ pub struct KeybindingsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EffectsConfig {
+    pub typewriter: Option<bool>,
+    pub typewriter_delay_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub theme: Option<String>,
     pub font: Option<FontConfig>,
@@ -47,6 +53,8 @@ pub struct Config {
     pub keybindings: Option<KeybindingsConfig>,
     pub shell: Option<String>,
     pub scrollback_lines: Option<usize>,
+    pub show_hints: Option<bool>,
+    pub effects: Option<EffectsConfig>,
 }
 
 impl Config {
