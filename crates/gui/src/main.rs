@@ -1015,11 +1015,14 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
 
                 for (tab_idx, tab) in self.tabs.iter_mut().enumerate() {
                     if let Some(pane) = tab.pane_mut(pane_id) {
-                        // Eğer daktilo modu açıksa kuyruğa ekle, devasa çıktılarda (16KB+) doğrudan işlet
-                        if is_typewriter && pane.pending_typewriter_bytes.len() < 16384 && pane.parser.grid().cursor_visible {
+                        // Daktilo modu yalnızca çok satırlı/uzun komut çıktılarında çalışmalı (>= 12 bayt ve \n içeren).
+                        // Kullanıcı klavyeden tek tek harf yazarken (echo, 1-4 bayt) geciktirilirse
+                        // kabuğun geri dönüşüyle imleç sola gidip sağa zıplar!
+                        let is_bulk_output = bytes.len() >= 12 && bytes.contains(&b'\n');
+
+                        if is_typewriter && is_bulk_output && pane.pending_typewriter_bytes.len() < 16384 && pane.parser.grid().cursor_visible {
                             pane.pending_typewriter_bytes.extend(bytes);
                         } else {
-                            // Tampon çok şişmişse veya daktilo kapalıysa doğrudan işlet
                             if !pane.pending_typewriter_bytes.is_empty() {
                                 let drained: Vec<u8> = pane.pending_typewriter_bytes.drain(..).collect();
                                 pane.parser.process_bytes(&drained);
