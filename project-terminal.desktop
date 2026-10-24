@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=Project Terminal
+GenericName=Terminal Emulator
+Comment=Fast GPU-accelerated terminal emulator built with Rust and WGPU
+Exec=/home/teha/Documents/GitHub/project-terminal/target/release/project-terminal
+Icon=project-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;commandline;cmd;terminal;
+StartupNotify=true
+Actions=NewWindow;NewTab;
+
+[Desktop Action NewWindow]
+Name=New Window
+Exec=/home/teha/Documents/GitHub/project-terminal/target/release/project-terminal
+
+[Desktop Action NewTab]
+Name=New Tab
+Exec=/home/teha/Documents/GitHub/project-terminal/target/release/project-terminal
