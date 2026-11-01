@@ -9,3 +9,4 @@ vte = { workspace = true }
 unicode-width = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+unicode-normalization = "0.1.25"

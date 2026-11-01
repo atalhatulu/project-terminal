@@ -128,6 +128,20 @@ pub struct CommandPaletteInfo<'a> {
     pub selected_index: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct ContextMenuItem {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub shortcut: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextMenuInfo {
+    pub pos: (f32, f32),
+    pub items: Vec<ContextMenuItem>,
+    pub selected_index: Option<usize>,
+}
+
 pub fn get_top_bar_layout(win_width: f32, tab_count: usize) -> (f32, f32, f32, (f32, f32, f32, f32)) {
     let bar_height = 30.0;
     let right_toolbar_w = 144.0;
@@ -217,13 +231,12 @@ pub struct TerminalRenderer {
     pub viewport: Viewport,
     pub text_atlas: TextAtlas,
     pub text_renderer: TextRenderer,
-    pub text_buffer: glyphon::Buffer,
     pub search_buffer: glyphon::Buffer,
     pub tab_buffer: glyphon::Buffer,
     pub tooltip_buffer: glyphon::Buffer,
     pub palette_buffer: glyphon::Buffer,
     pub palette_footer_buffer: glyphon::Buffer,
-    pub hint_buffer: glyphon::Buffer,
+    pub context_menu_buffer: glyphon::Buffer,
     pub tab_buffers: Vec<glyphon::Buffer>,
     pub pane_buffers: Vec<glyphon::Buffer>,
     pub pane_cached_states: Vec<Option<PaneCachedState>>,
@@ -239,7 +252,9 @@ pub struct TerminalRenderer {
     pub hovered_header_action: Option<HeaderAction>,
     pub hovered_top_bar: Option<TopBarHit>,
     pub pressed_top_bar: Option<TopBarHit>,
-    pub cursor_smooth_pos: Option<[f32; 2]>,
+    pub cursor_smooth_pos: std::collections::HashMap<usize, [f32; 2]>,
+    pub cursor_trail: Vec<[f32; 2]>,
+    pub cursor_velocity_x: f32,
     pub last_frame_time: std::time::Instant,
     pub is_animating: bool,
 
@@ -250,11 +265,13 @@ pub struct TerminalRenderer {
     bg_vertex_buffer: wgpu::Buffer,
     bg_vertex_capacity: usize,
 
-    // Sixel Görsel Render Hattı
+    // Sixel Görsel Render Hattı (Y2: Doku ve Bind Group Önbelleği)
     image_pipeline: wgpu::RenderPipeline,
     image_bind_group_layout: wgpu::BindGroupLayout,
     image_sampler: wgpu::Sampler,
     image_vertex_buffer: wgpu::Buffer,
+    image_cache: std::collections::HashMap<u64, (wgpu::Texture, wgpu::BindGroup)>,
+    image_cache_lru: Vec<u64>,
 }
 
 const IMAGE_SHADER: &str = r#"
@@ -482,8 +499,6 @@ impl TerminalRenderer {
         let cell_width = measured_width.ceil().max(6.0);
         let cell_height = (font_size * 1.35).ceil().max(12.0);
 
-        let text_buffer =
-            glyphon::Buffer::new(&mut font_system, Metrics::new(font_size, cell_height));
         let search_buffer =
             glyphon::Buffer::new(&mut font_system, Metrics::new(font_size, cell_height));
         let tab_buffer =
@@ -500,9 +515,9 @@ impl TerminalRenderer {
             &mut font_system,
             Metrics::new((font_size * 0.8).round().max(9.0), 22.0),
         );
-        let hint_buffer = glyphon::Buffer::new(
+        let context_menu_buffer = glyphon::Buffer::new(
             &mut font_system,
-            Metrics::new(font_size, cell_height),
+            Metrics::new(font_size * 0.88, cell_height * 0.95),
         );
 
         // 2. Arka Plan Dikdörtgen (Quad) Shader ve Pipeline Kurulumu
@@ -693,13 +708,12 @@ impl TerminalRenderer {
             viewport,
             text_atlas,
             text_renderer,
-            text_buffer,
             search_buffer,
             tab_buffer,
             tooltip_buffer,
             palette_buffer,
             palette_footer_buffer,
-            hint_buffer,
+            context_menu_buffer,
             tab_buffers: Vec::new(),
             pane_buffers: Vec::new(),
             pane_cached_states: Vec::new(),
@@ -715,7 +729,9 @@ impl TerminalRenderer {
             hovered_header_action: None,
             hovered_top_bar: None,
             pressed_top_bar: None,
-            cursor_smooth_pos: None,
+            cursor_smooth_pos: std::collections::HashMap::new(),
+            cursor_trail: Vec::new(),
+            cursor_velocity_x: 0.0,
             last_frame_time: std::time::Instant::now(),
             is_animating: false,
             bg_pipeline,
@@ -727,6 +743,8 @@ impl TerminalRenderer {
             image_bind_group_layout,
             image_sampler,
             image_vertex_buffer,
+            image_cache: std::collections::HashMap::new(),
+            image_cache_lru: Vec::new(),
         })
     }
 
@@ -736,6 +754,11 @@ impl TerminalRenderer {
         self.theme_cursor_color = cursor;
     }
 
+    
+    pub fn clear_image_cache(&mut self) {
+        self.image_cache.clear();
+        self.image_cache_lru.clear();
+    }
     pub fn set_opacity(&mut self, opacity: f32) {
         self.theme_opacity = opacity.clamp(0.05, 1.0);
     }
@@ -782,8 +805,6 @@ impl TerminalRenderer {
         self.cell_width = measured_width.ceil().max(6.0);
         self.cell_height = (font_size * 1.35).ceil().max(12.0);
 
-        self.text_buffer =
-            glyphon::Buffer::new(&mut self.font_system, glyphon::Metrics::new(font_size, self.cell_height));
         self.search_buffer =
             glyphon::Buffer::new(&mut self.font_system, glyphon::Metrics::new(font_size, self.cell_height));
         self.tab_buffer =
@@ -794,8 +815,6 @@ impl TerminalRenderer {
             glyphon::Buffer::new(&mut self.font_system, glyphon::Metrics::new(font_size * 0.9, self.cell_height));
         self.palette_footer_buffer =
             glyphon::Buffer::new(&mut self.font_system, glyphon::Metrics::new((font_size * 0.8).round().max(9.0), 22.0));
-        self.hint_buffer =
-            glyphon::Buffer::new(&mut self.font_system, glyphon::Metrics::new(font_size, self.cell_height));
         self.tab_buffers.clear();
         self.pane_buffers.clear();
         self.pane_cached_states.clear();
@@ -826,6 +845,7 @@ impl TerminalRenderer {
         panes: &[PaneDrawInfo],
         tabs: Option<&[TabInfo]>,
         palette: Option<&CommandPaletteInfo>,
+        context_menu: Option<&ContextMenuInfo>,
     ) -> anyhow::Result<()> {
         let output = match self.surface.get_current_texture() {
             Ok(tex) => tex,
@@ -915,30 +935,53 @@ impl TerminalRenderer {
                 let target_cx = pane_px + grid.cursor_col as f32 * self.cell_width;
                 let target_cy = pane_py + grid.cursor_row as f32 * self.cell_height;
 
-                let (curr_cx, curr_cy) = if let Some(ref mut pos) = self.cursor_smooth_pos {
+                let (curr_cx, curr_cy) = if let Some(pos) = self.cursor_smooth_pos.get_mut(&pane.id) {
                     if (target_cx - pos[0]).abs() > self.cell_width * 25.0
                         || (target_cy - pos[1]).abs() > self.cell_height * 15.0
                     {
                         pos[0] = target_cx;
                         pos[1] = target_cy;
+                        self.cursor_velocity_x = 0.0;
+                        self.cursor_trail.clear();
                         (target_cx, target_cy)
                     } else {
                         let decay = 45.0; // Daha hızlı, tok ve net oturma
                         let factor = (1.0 - (-decay * dt).exp()).clamp(0.0, 1.0);
+                        let prev_x = pos[0];
+                        let prev_y = pos[1];
                         pos[0] += (target_cx - pos[0]) * factor;
                         pos[1] += (target_cy - pos[1]) * factor;
+
+                        let dx = pos[0] - prev_x;
+                        if dt > 0.0001 {
+                            self.cursor_velocity_x = dx / dt;
+                        }
 
                         let dist_sq = (target_cx - pos[0]).powi(2) + (target_cy - pos[1]).powi(2);
                         if dist_sq > 0.5 {
                             self.is_animating = true;
+                            // Hareket anında ışık izi için geçmiş pozisyonu ekle
+                            if dist_sq > 4.0 {
+                                self.cursor_trail.push([prev_x, prev_y]);
+                                if self.cursor_trail.len() > 4 {
+                                    self.cursor_trail.remove(0);
+                                }
+                            }
                         } else {
                             pos[0] = target_cx;
                             pos[1] = target_cy;
+                            self.cursor_velocity_x = 0.0;
+                            if !self.cursor_trail.is_empty() {
+                                self.cursor_trail.remove(0);
+                                self.is_animating = true;
+                            }
                         }
                         (pos[0], pos[1])
                     }
                 } else {
-                    self.cursor_smooth_pos = Some([target_cx, target_cy]);
+                    self.cursor_smooth_pos.insert(pane.id, [target_cx, target_cy]);
+                    self.cursor_velocity_x = 0.0;
+                    self.cursor_trail.clear();
                     (target_cx, target_cy)
                 };
 
@@ -948,7 +991,7 @@ impl TerminalRenderer {
                 }
             }
 
-            let is_cache_valid = self.pane_cached_states.get(p_idx).and_then(|c| c.as_ref()).map_or(false, |c| {
+            let is_cache_valid = self.pane_cached_states.get(p_idx).and_then(|c| c.as_ref()).is_some_and(|c| {
                 c.pane_id == pane.id
                     && c.version == grid.version
                     && c.cols == pane.cols
@@ -1034,14 +1077,20 @@ impl TerminalRenderer {
                             (None, None) => {}
                         }
 
-                        // Altı çizili metin desteği ve yatay kümeleme (SGR 4)
-                        let cell_ul = if cell.underline && !(is_cursor && grid.cursor_shape == CursorShape::Underline) {
-                            Some([
-                                eff_fg.0 as f32 / 255.0,
-                                eff_fg.1 as f32 / 255.0,
-                                eff_fg.2 as f32 / 255.0,
-                                0.9,
-                            ])
+                        // Altı çizili metin desteği ve yatay kümeleme (SGR 4 veya OSC 8 Köprü)
+                        let is_hyperlink = cell.get_hyperlink_id().is_some();
+                        let cell_ul = if (cell.underline || is_hyperlink) && !(is_cursor && grid.cursor_shape == CursorShape::Underline) {
+                            if is_hyperlink {
+                                // OSC 8 linkleri için hoş mavi tonlu alt çizgi
+                                Some([122.0 / 255.0, 162.0 / 255.0, 247.0 / 255.0, 0.85])
+                            } else {
+                                Some([
+                                    eff_fg.0 as f32 / 255.0,
+                                    eff_fg.1 as f32 / 255.0,
+                                    eff_fg.2 as f32 / 255.0,
+                                    0.9,
+                                ])
+                            }
                         } else {
                             None
                         };
@@ -1156,6 +1205,26 @@ impl TerminalRenderer {
             if let Some((cx, cy, shape)) = smooth_cursor_quad {
                 match shape {
                     CursorShape::Block => {
+                        // İmleç Hızlı Hareket Ederken Arkasında Işık İzi (Ghost Trail)
+                        let trail_len = self.cursor_trail.len();
+                        for (i, tpos) in self.cursor_trail.iter().enumerate() {
+                            let factor = (i + 1) as f32 / (trail_len + 1) as f32;
+                            let trail_color = [
+                                cursor_color[0],
+                                cursor_color[1],
+                                cursor_color[2],
+                                cursor_color[3] * 0.28 * factor,
+                            ];
+                            push_quad(
+                                &mut bg_vertices,
+                                tpos[0],
+                                tpos[1],
+                                self.cell_width,
+                                self.cell_height,
+                                trail_color,
+                            );
+                        }
+
                         // Ana blok gövdesi (hafif yuvarlak köşeli etki veren dolgun gövde)
                         push_quad(
                             &mut bg_vertices,
@@ -1171,12 +1240,22 @@ impl TerminalRenderer {
                         let blink_cycle = now_ms % 3500;
                         let is_eye_blinking = blink_cycle > 3300;
 
+                        // Hareket yönüne göre bakış yönü (Look direction):
+                        // Sağa doğru hızlı hareket ederken gözler hafif sağa, sola giderken sola kayar
+                        let look_offset_x = if self.cursor_velocity_x > 20.0 {
+                            1.0
+                        } else if self.cursor_velocity_x < -20.0 {
+                            -1.0
+                        } else {
+                            0.0
+                        };
+
                         let eye_color = [15.0 / 255.0, 18.0 / 255.0, 26.0 / 255.0, 1.0];
                         let eye_w = 2.0;
                         let eye_h = if is_eye_blinking { 1.0 } else { 3.0 };
 
-                        let left_eye_x = (cx + self.cell_width * 0.28).round();
-                        let right_eye_x = (cx + self.cell_width * 0.62).round();
+                        let left_eye_x = (cx + self.cell_width * 0.28 + look_offset_x).round();
+                        let right_eye_x = (cx + self.cell_width * 0.62 + look_offset_x).round();
                         let eye_y = (cy + self.cell_height * 0.38).round();
 
                         push_quad(&mut bg_vertices, left_eye_x, eye_y, eye_w, eye_h, eye_color);
@@ -1396,7 +1475,7 @@ impl TerminalRenderer {
                     }
 
                     let close_fg = if is_close_hovered || is_close_pressed {
-                        [255.0 / 255.0, 255.0 / 255.0, 255.0 / 255.0, 1.0]
+                        [1.0, 1.0, 1.0, 1.0]
                     } else if is_active {
                         [160.0 / 255.0, 166.0 / 255.0, 190.0 / 255.0, 0.75]
                     } else {
@@ -1716,8 +1795,7 @@ impl TerminalRenderer {
                 pal_spans.push(("  Eşleşen komut bulunamadı".to_string(), glyphon::Attrs::new().family(glyphon::Family::Name(&self.font_family)).style(glyphon::Style::Italic).color(glyphon::Color::rgb(130, 135, 155))));
                 pal_spans.push(("\n".to_string(), glyphon::Attrs::new().family(glyphon::Family::Name(&self.font_family))));
             } else {
-                for idx in start_idx..end_idx {
-                    let item = &items[idx];
+                for (idx, item) in items.iter().enumerate().take(end_idx).skip(start_idx) {
                     let is_sel = idx == selected;
 
                     let title_fg = if is_sel {
@@ -1753,6 +1831,117 @@ impl TerminalRenderer {
             self.palette_buffer.shape_until_scroll(&mut self.font_system, false);
 
             palette_overlay = Some((px, py, pw, ph, total, selected));
+        }
+
+        // 6. Modern Sağ Tık Bağlam Menüsü (Context Menu Overlay)
+        let mut context_menu_overlay = None;
+        if let Some(menu) = context_menu {
+            let screen_w = self.config.width as f32;
+            let screen_h = self.config.height as f32;
+
+            let item_h = 28.0;
+            let mw = 220.0;
+            let mh = (menu.items.len() as f32 * item_h) + 8.0;
+
+            // Ekran sınırlarına taşmayı önleme
+            let mx = menu.pos.0.min(screen_w - mw - 8.0).max(8.0);
+            let my = menu.pos.1.min(screen_h - mh - 8.0).max(8.0);
+
+            // Dış derinlik gölgesi
+            push_quad(
+                &mut bg_vertices,
+                mx - 2.0,
+                my - 2.0,
+                mw + 4.0,
+                mh + 4.0,
+                [8.0 / 255.0, 10.0 / 255.0, 16.0 / 255.0, 0.75],
+            );
+
+            // Menü gövde kartı
+            push_quad(
+                &mut bg_vertices,
+                mx,
+                my,
+                mw,
+                mh,
+                [20.0 / 255.0, 22.0 / 255.0, 32.0 / 255.0, 0.98],
+            );
+
+            // Menü kenarlığı
+            let border_c = [56.0 / 255.0, 64.0 / 255.0, 90.0 / 255.0, 0.9];
+            push_quad(&mut bg_vertices, mx, my, mw, 1.0, border_c);
+            push_quad(&mut bg_vertices, mx, my + mh - 1.0, mw, 1.0, border_c);
+            push_quad(&mut bg_vertices, mx, my, 1.0, mh, border_c);
+            push_quad(&mut bg_vertices, mx + mw - 1.0, my, 1.0, mh, border_c);
+
+            // Sol tarafta şık dikey tema aksanı
+            push_quad(&mut bg_vertices, mx, my, 2.5, mh, self.theme_cursor_color);
+
+            // Menü öğeleri hover arka planı
+            for (idx, _) in menu.items.iter().enumerate() {
+                let iy = my + 4.0 + idx as f32 * item_h;
+                if menu.selected_index == Some(idx) {
+                    push_quad(
+                        &mut bg_vertices,
+                        mx + 3.0,
+                        iy,
+                        mw - 6.0,
+                        item_h,
+                        [40.0 / 255.0, 48.0 / 255.0, 72.0 / 255.0, 0.85],
+                    );
+                }
+            }
+
+            // Metin hazırlığı
+            let mut menu_spans = Vec::new();
+            for (idx, item) in menu.items.iter().enumerate() {
+                let is_sel = menu.selected_index == Some(idx);
+                let title_fg = if is_sel {
+                    glyphon::Color::rgb(255, 255, 255)
+                } else {
+                    glyphon::Color::rgb(215, 220, 235)
+                };
+                let sc_fg = if is_sel {
+                    glyphon::Color::rgb(130, 170, 255)
+                } else {
+                    glyphon::Color::rgb(115, 120, 145)
+                };
+
+                let title_len = item.title.chars().count();
+                let sc_len = item.shortcut.chars().count();
+                let total_chars: usize = 24;
+                let spaces = total_chars.saturating_sub(title_len + sc_len);
+                let space_str = " ".repeat(spaces.max(2));
+
+                menu_spans.push((
+                    format!("  {}", item.title),
+                    glyphon::Attrs::new()
+                        .family(glyphon::Family::Name(&self.font_family))
+                        .weight(if is_sel { glyphon::Weight::BOLD } else { glyphon::Weight::NORMAL })
+                        .color(title_fg),
+                ));
+                menu_spans.push((
+                    space_str,
+                    glyphon::Attrs::new().family(glyphon::Family::Name(&self.font_family)),
+                ));
+                menu_spans.push((
+                    format!("{}\n", item.shortcut),
+                    glyphon::Attrs::new()
+                        .family(glyphon::Family::Name(&self.font_family))
+                        .color(sc_fg),
+                ));
+            }
+
+            let span_refs: Vec<(&str, glyphon::Attrs)> = menu_spans.iter().map(|(t, a)| (t.as_str(), *a)).collect();
+            self.context_menu_buffer.set_rich_text(
+                &mut self.font_system,
+                span_refs,
+                glyphon::Attrs::new().family(glyphon::Family::Name(&self.font_family)),
+                glyphon::Shaping::Advanced,
+            );
+            self.context_menu_buffer.shape_until_scroll(&mut self.font_system, false);
+
+            context_menu_overlay = Some((mx, my, mw, mh));
         }
 
         // Arka plan vertex buffer'ına yaz
@@ -1898,6 +2087,23 @@ impl TerminalRenderer {
             });
         }
 
+        if let Some((mx, my, mw, mh)) = context_menu_overlay {
+            text_areas.push(TextArea {
+                buffer: &self.context_menu_buffer,
+                left: mx + 4.0,
+                top: my + 6.0,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: mx as i32,
+                    top: my as i32,
+                    right: (mx + mw) as i32,
+                    bottom: (my + mh) as i32,
+                },
+                default_color: glyphon::Color::rgb(215, 220, 235),
+                custom_glyphs: &[],
+            });
+        }
+
         self.text_renderer
             .prepare(
                 &self.device,
@@ -1939,7 +2145,91 @@ impl TerminalRenderer {
                 pass.draw(0..bg_vertices.len() as u32, 0..1);
             }
 
-            // Adım 1.5: Sixel Görsellerini Çiz
+            // Adım 1.5: Sixel Görsellerini Çiz (Y2: Doku ve Bind Group Önbelleği ile sıfır yeniden yükleme)
+            let mut all_image_vertices: Vec<ImageVertex> = Vec::new();
+            let mut image_draw_batches = Vec::new();
+
+                        // Bonus: Eğer pane'lerdeki görseller silinmişse (örneğin clear_display(2) veya reset sonrası)
+            // bellekte yetim kalan dokuları temizle
+            let active_image_ids: std::collections::HashSet<u64> = panes
+                .iter()
+                .flat_map(|p| p.grid.images.iter().map(|img| img.id))
+                .collect();
+            if self.image_cache.len() > active_image_ids.len() {
+                self.image_cache.retain(|id, _| active_image_ids.contains(id));
+                self.image_cache_lru.retain(|id| active_image_ids.contains(id));
+            }
+
+            // Önce eksik dokuları önbelleğe yükle
+            for pane in panes {
+                for img in &pane.grid.images {
+                    if img.width == 0 || img.height == 0 || img.rgba.is_empty() {
+                        continue;
+                    }
+                    if !self.image_cache.contains_key(&img.id) {
+                        let texture_size = wgpu::Extent3d {
+                            width: img.width as u32,
+                            height: img.height as u32,
+                            depth_or_array_layers: 1,
+                        };
+                        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("Cached Sixel Texture"),
+                            size: texture_size,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+
+                        self.queue.write_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            &img.rgba,
+                            wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(4 * img.width as u32),
+                                rows_per_image: Some(img.height as u32),
+                            },
+                            texture_size,
+                        );
+
+                        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("Cached Sixel Bind Group"),
+                            layout: &self.image_bind_group_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.image_sampler),
+                                },
+                            ],
+                        });
+
+                        self.image_cache.insert(img.id, (texture, bind_group));
+                        self.image_cache_lru.push(img.id);
+
+                        // Önbellek boyutu sınırı (en fazla 64 görsel)
+                        if self.image_cache.len() > 64 {
+                            if let Some(old_id) = self.image_cache_lru.first().copied() {
+                                self.image_cache.remove(&old_id);
+                                self.image_cache_lru.remove(0);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Tepe noktalarını ve çizim paketlerini hazırla
             for pane in panes {
                 let pane_x = padding_left + pane.col_offset as f32 * self.cell_width;
                 let pane_y = padding_top + pane.row_offset as f32 * self.cell_height;
@@ -1948,76 +2238,48 @@ impl TerminalRenderer {
                     if img.width == 0 || img.height == 0 || img.rgba.is_empty() {
                         continue;
                     }
-                    let img_x = pane_x + img.col as f32 * self.cell_width;
-                    let img_y = pane_y + img.row as f32 * self.cell_height;
-                    let img_w = img.width as f32;
-                    let img_h = img.height as f32;
+                    if let Some((_, bind_group)) = self.image_cache.get(&img.id) {
+                        let img_x = pane_x + img.col as f32 * self.cell_width;
+                        let img_y = pane_y + img.row as f32 * self.cell_height;
+                        let img_w = img.width as f32;
+                        let img_h = img.height as f32;
 
-                    let texture_size = wgpu::Extent3d {
-                        width: img.width as u32,
-                        height: img.height as u32,
-                        depth_or_array_layers: 1,
-                    };
-                    let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("Sixel Texture"),
-                        size: texture_size,
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
+                        let v0 = ImageVertex { position: [img_x, img_y], tex_coords: [0.0, 0.0] };
+                        let v1 = ImageVertex { position: [img_x + img_w, img_y], tex_coords: [1.0, 0.0] };
+                        let v2 = ImageVertex { position: [img_x, img_y + img_h], tex_coords: [0.0, 1.0] };
+                        let v3 = ImageVertex { position: [img_x + img_w, img_y + img_h], tex_coords: [1.0, 1.0] };
+
+                        let start_vertex = all_image_vertices.len() as u32;
+                        all_image_vertices.extend_from_slice(&[v0, v2, v1, v1, v2, v3]);
+                        image_draw_batches.push((bind_group, start_vertex..start_vertex + 6));
+                    }
+                }
+            }
+
+            if !all_image_vertices.is_empty() {
+                let required_size = (all_image_vertices.len() * std::mem::size_of::<ImageVertex>()) as u64;
+                if required_size > self.image_vertex_buffer.size() {
+                    self.image_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Expanded Image Vertex Buffer"),
+                        size: required_size.max(self.image_vertex_buffer.size() * 2),
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
                     });
+                }
 
-                    self.queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        &img.rgba,
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(4 * img.width as u32),
-                            rows_per_image: Some(img.height as u32),
-                        },
-                        texture_size,
-                    );
+                self.queue.write_buffer(
+                    &self.image_vertex_buffer,
+                    0,
+                    bytemuck::cast_slice(&all_image_vertices),
+                );
 
-                    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("Sixel Bind Group"),
-                        layout: &self.image_bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(&view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&self.image_sampler),
-                            },
-                        ],
-                    });
+                pass.set_pipeline(&self.image_pipeline);
+                pass.set_bind_group(0, &self.bg_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
 
-                    let v0 = ImageVertex { position: [img_x, img_y], tex_coords: [0.0, 0.0] };
-                    let v1 = ImageVertex { position: [img_x + img_w, img_y], tex_coords: [1.0, 0.0] };
-                    let v2 = ImageVertex { position: [img_x, img_y + img_h], tex_coords: [0.0, 1.0] };
-                    let v3 = ImageVertex { position: [img_x + img_w, img_y + img_h], tex_coords: [1.0, 1.0] };
-                    let quad_vertices = [v0, v2, v1, v1, v2, v3];
-
-                    self.queue.write_buffer(
-                        &self.image_vertex_buffer,
-                        0,
-                        bytemuck::cast_slice(&quad_vertices),
-                    );
-
-                    pass.set_pipeline(&self.image_pipeline);
-                    pass.set_bind_group(0, &self.bg_bind_group, &[]);
-                    pass.set_bind_group(1, &bind_group, &[]);
-                    pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
-                    pass.draw(0..6, 0..1);
+                for (bind_group, range) in image_draw_batches {
+                    pass.set_bind_group(1, bind_group, &[]);
+                    pass.draw(range, 0..1);
                 }
             }
 
@@ -2046,6 +2308,7 @@ impl TerminalRenderer {
                 ghost_hint: None,
             }],
             tabs,
+            None,
             None,
         )
     }

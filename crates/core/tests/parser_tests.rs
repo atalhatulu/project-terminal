@@ -332,7 +332,7 @@ fn test_clear_display_modes_2_and_3() {
     for _ in 0..30 {
         parser.process_bytes(b"Line\r\n");
     }
-    assert!(parser.grid().scrollback.len() > 0);
+    assert!(!parser.grid().scrollback.is_empty());
 
     // CSI 3 J clears scrollback, but does NOT reset active screen or cursor
     let cur_r = parser.grid().cursor_row;
@@ -376,7 +376,11 @@ fn test_get_url_at() {
 #[test]
 fn test_get_file_target_at() {
     let mut parser = CoreParser::new(80, 24);
-    // Cargo.toml exists in repository root
+    // T1: Proje kök dizinini açıkça cwd olarak ata (cwd-bağımsız test)
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let root_dir = std::path::Path::new(manifest_dir).parent().unwrap().parent().unwrap();
+    parser.grid_mut().cwd = Some(root_dir.to_str().unwrap().to_string());
+
     parser.process_bytes(b"Error in Cargo.toml:12:4 occurred here");
 
     let target = parser.grid().get_file_target_at(12, 0);
@@ -405,7 +409,7 @@ fn test_command_block_jumping() {
     }
     parser.process_bytes(b"\x1b]133;D;0\x07");
 
-    assert!(parser.grid().scrollback.len() > 0);
+    assert!(!parser.grid().scrollback.is_empty());
 
     // Jump to prev command
     let jumped = parser.grid_mut().scroll_to_prev_command();
@@ -690,3 +694,106 @@ fn test_kitty_keyboard_protocol() {
 
 
 
+
+#[test]
+fn test_multiline_get_selected_text() {
+    let mut parser = CoreParser::new(80, 24);
+    parser.process_bytes(b"First line text\r\nSecond line text\r\nThird line text");
+
+    // Satır 0 sütun 0'dan satır 2 sütun 4'e kadar seç
+    parser.grid_mut().set_selection(Some(Selection::new(0, 0, 4, 2)));
+
+    let selected = parser.grid().get_selected_text();
+    assert!(selected.is_some());
+    let text = selected.unwrap();
+    assert_eq!(text, "First line text\nSecond line text\nThird");
+}
+
+#[test]
+fn test_non_ascii_set_search_query() {
+    let mut parser = CoreParser::new(80, 24);
+    // Türkçe ve UTF-8 karakterler içeren metin: "Örnek terminal Türkçe desteği"
+    parser.process_bytes("Örnek terminal Türkçe desteği".as_bytes());
+
+    parser.grid_mut().set_search_query(Some("Türkçe".to_string()));
+    assert_eq!(parser.grid().search_matches.len(), 1);
+
+    let m = &parser.grid().search_matches[0];
+    // "Örnek terminal " -> 15 karakter
+    assert_eq!(m.start_col, 15);
+    // "Türkçe" -> 6 karakter
+    assert_eq!(m.end_col, 21);
+}
+
+#[test]
+fn test_scrollback_ring_clear_then_push() {
+    let mut ring = ScrollbackRing::with_capacity(3);
+    let c1 = [Cell { c: 'A', ..Cell::default() }];
+    let c2 = [Cell { c: 'B', ..Cell::default() }];
+    let c3 = [Cell { c: 'C', ..Cell::default() }];
+    let c4 = [Cell { c: 'D', ..Cell::default() }];
+
+    ring.push(&c1);
+    ring.push(&c2);
+    ring.push(&c3);
+    assert_eq!(ring.len(), 3);
+    assert_eq!(ring[0][0].c, 'A');
+
+    // clear sonrası tekrar ekleme (clear-then-push)
+    ring.clear();
+    assert_eq!(ring.len(), 0);
+    assert!(ring.is_empty());
+
+    ring.push(&c4);
+    assert_eq!(ring.len(), 1);
+    assert_eq!(ring[0][0].c, 'D');
+}
+
+#[test]
+fn test_sixel_cell_height_and_spanned_rows() {
+    let mut parser = CoreParser::new(80, 24);
+    // Varsayılan cell_height = 16px iken: 30px görsel -> 30.div_ceil(16) = 2 satır
+    let sixel_data = b"\x1bPq\"1;1;10;32#0;2;0;0;0#0!10~-!10~-!10~-!10~-!10~-\x1b\\";
+    parser.process_bytes(sixel_data);
+
+    assert_eq!(parser.grid().images.len(), 1);
+    let img = &parser.grid().images[0];
+    assert_eq!(img.height, 30);
+    assert_eq!(img.rows_spanned, 2);
+
+    // Y5: 20px hücre yüksekliği senaryosu
+    let mut parser20 = CoreParser::new(80, 24);
+    parser20.set_cell_height(20);
+    parser20.process_bytes(sixel_data);
+
+    assert_eq!(parser20.grid().images.len(), 1);
+    let img20 = &parser20.grid().images[0];
+    assert_eq!(img20.height, 30);
+    // 30px görsel 20px hücre yüksekliğinde 30.div_ceil(20) = 2 satır kaplar
+    assert_eq!(img20.rows_spanned, 2);
+
+    // 45px görsel 20px hücrede 45.div_ceil(20) = 3 satır kaplar
+    let mut parser_tall = CoreParser::new(80, 24);
+    parser_tall.set_cell_height(20);
+    // 8 band * 6 = 48px
+    let sixel_tall = b"\x1bPq\"1;1;10;48#0;2;0;0;0#0!10~-!10~-!10~-!10~-!10~-!10~-!10~-!10~-\x1b\\";
+    parser_tall.process_bytes(sixel_tall);
+    assert_eq!(parser_tall.grid().images[0].rows_spanned, 3);
+}
+
+#[test]
+fn test_turkish_istanbul_search_no_panic() {
+    let mut parser = CoreParser::new(80, 24);
+    parser.process_bytes("İstanbul hava durumu bugün çok güzel".as_bytes());
+
+    // "İ" araması panic etmemeli ve 1 eşleşme bulmalı
+    parser.grid_mut().set_search_query(Some("İ".to_string()));
+    assert_eq!(parser.grid().search_matches.len(), 1);
+    assert_eq!(parser.grid().search_matches[0].start_col, 0);
+    assert_eq!(parser.grid().search_matches[0].end_col, 1);
+
+    // "i" araması panic etmemeli
+    parser.grid_mut().set_search_query(Some("i".to_string()));
+    // "İstanbul" ve "bugün" içinde 'i' veya 'İ' eşleşmesi
+    assert!(!parser.grid().search_matches.is_empty());
+}

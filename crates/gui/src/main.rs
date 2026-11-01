@@ -9,8 +9,8 @@ use std::sync::Arc;
 use term_core::{CoreParser, Selection};
 use term_pty::Pty;
 use term_render::{
-    get_top_bar_hit, CommandPaletteInfo, CommandPaletteItem, HeaderAction, PaneDrawInfo, TabInfo,
-    TerminalRenderer, TopBarHit,
+    get_top_bar_hit, CommandPaletteInfo, CommandPaletteItem, ContextMenuInfo, ContextMenuItem,
+    HeaderAction, PaneDrawInfo, TabInfo, TerminalRenderer, TopBarHit,
 };
 
 const ALL_COMMANDS: &[CommandPaletteItem] = &[
@@ -166,7 +166,7 @@ pub enum AppEvent {
     PtyExit { pane_id: usize },
     BlinkTick,
     TypewriterTick,
-    ConfigReloaded(Config),
+    ConfigReloaded(Box<Config>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -262,6 +262,7 @@ struct TerminalApp {
     command_palette_query: String,
     command_palette_selected: usize,
     last_key_time: std::time::Instant,
+    context_menu: Option<ContextMenuInfo>,
 }
 
 impl TerminalApp {
@@ -304,6 +305,7 @@ impl TerminalApp {
             command_palette_query: String::new(),
             command_palette_selected: 0,
             last_key_time: std::time::Instant::now(),
+            context_menu: None,
         }
     }
 
@@ -488,6 +490,30 @@ opacity = 0.95
                     }
                 }
             }
+            "clear_screen" => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
+                    if let Some(pane) = tab.active_pane_mut() {
+                        let _ = pane.pty.write_bytes(b"\x0c");
+                    }
+                }
+            }
+            "open_link_at_cursor" => {
+                let has_header = self.has_header_bar();
+                let (col, row) = if let Some(renderer) = &self.renderer {
+                    renderer.pixel_to_cell(self.last_cursor_pos.0, self.last_cursor_pos.1, has_header)
+                } else {
+                    (0, 0)
+                };
+                if let Some(tab) = self.active_tab() {
+                    if let Some(pane) = tab.active_pane() {
+                        if let Some(url) = pane.parser.grid().get_url_at(col, row) {
+                            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                        } else if let Some(target) = pane.parser.grid().get_file_target_at(col, row) {
+                            let _ = std::process::Command::new("xdg-open").arg(&target.path).spawn();
+                        }
+                    }
+                }
+            }
             "open_config" => {
                 self.open_settings();
             }
@@ -569,6 +595,7 @@ opacity = 0.95
         if let (Some(renderer), Some(inner)) = (&mut self.renderer, inner_size) {
             let (new_cols, new_rows) =
                 renderer.calculate_grid_size(inner.width, inner.height, has_tabs);
+            let cell_h = renderer.cell_height.ceil() as usize;
             self.cols = new_cols;
             self.rows = new_rows;
 
@@ -576,6 +603,7 @@ opacity = 0.95
                 let geoms = tab.geometries(new_cols, new_rows);
                 for geom in geoms {
                     if let Some(pane) = tab.pane_mut(geom.pane_id) {
+                        pane.parser.set_cell_height(cell_h);
                         pane.parser.resize(geom.cols, geom.rows);
                         let _ = pane.pty.resize(geom.cols as u16, geom.rows as u16);
                     }
@@ -724,25 +752,41 @@ opacity = 0.95
             let geoms = tab.geometries(self.cols, self.rows);
             let active_id = tab.active_pane_id;
             if let Some(active_geom) = geoms.iter().find(|g| g.pane_id == active_id) {
-                let neighbor = geoms.iter().find(|g| {
-                    if g.pane_id == active_id {
-                        return false;
-                    }
-                    match (dir, forward) {
+                let neighbor = geoms
+                    .iter()
+                    .filter(|g| {
+                        if g.pane_id == active_id {
+                            return false;
+                        }
+                        match (dir, forward) {
+                            (SplitDirection::Horizontal, false) => {
+                                g.col_offset + g.cols <= active_geom.col_offset
+                            }
+                            (SplitDirection::Horizontal, true) => {
+                                g.col_offset >= active_geom.col_offset + active_geom.cols
+                            }
+                            (SplitDirection::Vertical, false) => {
+                                g.row_offset + g.rows <= active_geom.row_offset
+                            }
+                            (SplitDirection::Vertical, true) => {
+                                g.row_offset >= active_geom.row_offset + active_geom.rows
+                            }
+                        }
+                    })
+                    .min_by_key(|g| match (dir, forward) {
                         (SplitDirection::Horizontal, false) => {
-                            g.col_offset + g.cols <= active_geom.col_offset
+                            active_geom.col_offset.saturating_sub(g.col_offset + g.cols)
                         }
                         (SplitDirection::Horizontal, true) => {
-                            g.col_offset >= active_geom.col_offset + active_geom.cols
+                            g.col_offset.saturating_sub(active_geom.col_offset + active_geom.cols)
                         }
                         (SplitDirection::Vertical, false) => {
-                            g.row_offset + g.rows <= active_geom.row_offset
+                            active_geom.row_offset.saturating_sub(g.row_offset + g.rows)
                         }
                         (SplitDirection::Vertical, true) => {
-                            g.row_offset >= active_geom.row_offset + active_geom.rows
+                            g.row_offset.saturating_sub(active_geom.row_offset + active_geom.rows)
                         }
-                    }
-                });
+                    });
 
                 if let Some(target) = neighbor {
                     tab.active_pane_id = target.pane_id;
@@ -771,12 +815,11 @@ opacity = 0.95
 
     fn resize_active_pane(&mut self, dir: SplitDirection, delta: f32) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
-            if !tab.is_zoomed && tab.panes.len() > 1 {
-                if tab.tree.adjust_pane_ratio(tab.active_pane_id, dir, delta) {
-                    self.update_grid_size();
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+            if !tab.is_zoomed && tab.panes.len() > 1
+                && tab.tree.adjust_pane_ratio(tab.active_pane_id, dir, delta) {
+                self.update_grid_size();
+                if let Some(win) = &self.window {
+                    win.request_redraw();
                 }
             }
         }
@@ -825,9 +868,20 @@ opacity = 0.95
             event_loop.exit();
             return;
         }
-        if self.active_tab_index >= self.tabs.len() {
+        // K5: Kapatılan sekme aktif sekmeden önceyse indeks sola kayar; aktif sekmeyse sınır kontrolü yapılır
+        if index < self.active_tab_index {
+            self.active_tab_index -= 1;
+        } else if self.active_tab_index >= self.tabs.len() {
             self.active_tab_index = self.tabs.len() - 1;
         }
+
+        // D4: Kapatma sonrası hovered_top_bar ve basılı durumları sıfırla
+        self.hovered_top_bar = None;
+        if let Some(renderer) = &mut self.renderer {
+            renderer.hovered_top_bar = None;
+            renderer.pressed_top_bar = None;
+        }
+
         self.update_grid_size();
         self.update_window_title();
         if let Some(win) = &self.window {
@@ -983,7 +1037,7 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                                     last_modified = Some(mod_time);
                                     let new_cfg = Config::load();
                                     if config_proxy
-                                        .send_event(AppEvent::ConfigReloaded(new_cfg))
+                                        .send_event(AppEvent::ConfigReloaded(Box::new(new_cfg)))
                                         .is_err()
                                     {
                                         break;
@@ -1140,6 +1194,7 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                 }
             }
             AppEvent::ConfigReloaded(new_cfg) => {
+                let new_cfg = *new_cfg;
                 tracing::info!("Ayar dosyası güncellendi, uygulanıyor...");
                 self.config = new_cfg;
                 if let Some(renderer) = &mut self.renderer {
@@ -1150,6 +1205,7 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                     );
                     renderer.set_opacity(self.config.opacity());
                     renderer.set_font_size(self.config.font_size());
+                    renderer.clear_image_cache();
                 }
                 for tab in &mut self.tabs {
                     for pane in &mut tab.panes {
@@ -1239,7 +1295,12 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                         })
                         .collect();
 
-                    if let Err(e) = renderer.render_panes(&draw_panes, Some(&tab_infos), pal_info.as_ref()) {
+                    if let Err(e) = renderer.render_panes(
+                        &draw_panes,
+                        Some(&tab_infos),
+                        pal_info.as_ref(),
+                        self.context_menu.as_ref(),
+                    ) {
                         tracing::warn!("Render hatası: {:?}", e);
                     }
 
@@ -1253,16 +1314,14 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
             }
-            WindowEvent::Ime(ime) => match ime {
-                winit::event::Ime::Commit(text) => {
-                    if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
-                        if let Some(pane) = tab.active_pane_mut() {
-                            let _ = pane.pty.write_bytes(text.as_bytes());
-                        }
+            WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
+                    if let Some(pane) = tab.active_pane_mut() {
+                        let _ = pane.pty.write_bytes(text.as_bytes());
                     }
                 }
-                _ => {}
-            },
+            }
+            WindowEvent::Ime(_) => {}
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -1288,6 +1347,15 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                 let is_shift = self.modifiers.shift_key();
 
                 self.last_key_time = std::time::Instant::now();
+
+                // Bağlam menüsü açıkken Escape basılırsa kapat
+                if self.context_menu.is_some() && matches!(&logical_key, Key::Named(NamedKey::Escape)) {
+                    self.context_menu = None;
+                    if let Some(win) = &self.window {
+                        win.request_redraw();
+                    }
+                    return;
+                }
 
                 // 0. Ctrl + Shift + P ile Komut Paletini Aç / Kapat
                 if is_ctrl && is_shift && matches!(&logical_key, Key::Character(c) if c.eq_ignore_ascii_case("p")) {
@@ -1610,6 +1678,14 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                         if pane.parser.grid().search_query.is_some() {
                             match &logical_key {
                                 Key::Named(NamedKey::Escape) => {
+                                    pane.parser.grid_mut().set_search_query(None);
+                                    if let Some(win) = &self.window {
+                                        win.request_redraw();
+                                    }
+                                    return;
+                                }
+                                Key::Character(c) if is_ctrl && !is_alt && c.eq_ignore_ascii_case("c") => {
+                                    // O5: Arama modundayken Ctrl+C aramayı kapatır, kabuğa SIGINT göndermez
                                     pane.parser.grid_mut().set_search_query(None);
                                     if let Some(win) = &self.window {
                                         win.request_redraw();
@@ -2068,6 +2144,41 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                     }
                 }
 
+                // Açık bağlam menüsü üzerindeki gezinme (Hover)
+                if let Some(menu) = &mut self.context_menu {
+                    let screen_w = self.window.as_ref().map(|w| w.inner_size().width as f32).unwrap_or(800.0);
+                    let screen_h = self.window.as_ref().map(|w| w.inner_size().height as f32).unwrap_or(600.0);
+                    let item_h = 28.0;
+                    let mw = 220.0;
+                    let mh = (menu.items.len() as f32 * item_h) + 8.0;
+                    let mx = menu.pos.0.min(screen_w - mw - 8.0).max(8.0);
+                    let my = menu.pos.1.min(screen_h - mh - 8.0).max(8.0);
+
+                    let (cur_x, cur_y) = self.last_cursor_pos;
+                    let mut new_sel = None;
+                    if cur_x >= mx && cur_x <= mx + mw && cur_y >= my && cur_y <= my + mh {
+                        let rel_y = cur_y - (my + 4.0);
+                        if rel_y >= 0.0 {
+                            let idx = (rel_y / item_h).floor() as usize;
+                            if idx < menu.items.len() {
+                                new_sel = Some(idx);
+                            }
+                        }
+                    }
+                    if menu.selected_index != new_sel {
+                        menu.selected_index = new_sel;
+                        if let Some(win) = &self.window {
+                            win.request_redraw();
+                        }
+                    }
+                    if new_sel.is_some() {
+                        if let Some(win) = &self.window {
+                            win.set_cursor(winit::window::CursorIcon::Pointer);
+                        }
+                        return;
+                    }
+                }
+
                 // Panel sınır çizgisi üzerine gelme kontrolü (Divider Hover)
                 if let Some(div) = self.find_divider_at(self.last_cursor_pos.0, self.last_cursor_pos.1) {
                     if let Some(win) = &self.window {
@@ -2086,7 +2197,6 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                     (0, 0)
                 };
 
-                let is_ctrl = self.modifiers.control_key();
                 let is_shift = self.modifiers.shift_key();
                 let mouse_pressed = self.mouse_pressed;
                 let selection_start = self.selection_start;
@@ -2101,26 +2211,20 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
 
                     if let Some(pane) = tab.pane_mut(target_info.0) {
                         let (curr_col, curr_row) = (target_info.1, target_info.2);
-                        if is_ctrl {
-                            let is_link = pane.parser.grid().get_url_at(curr_col, curr_row).is_some()
-                                || pane.parser.grid().get_file_target_at(curr_col, curr_row).is_some();
-                            if let Some(win) = &self.window {
-                                win.set_cursor(if is_link {
-                                    winit::window::CursorIcon::Pointer
-                                } else {
-                                    winit::window::CursorIcon::Text
-                                });
-                            }
-                        } else if let Some(win) = &self.window {
-                            win.set_cursor(winit::window::CursorIcon::Text);
+                        let is_link = pane.parser.grid().get_url_at(curr_col, curr_row).is_some()
+                            || pane.parser.grid().get_file_target_at(curr_col, curr_row).is_some();
+                        if let Some(win) = &self.window {
+                            win.set_cursor(if is_link {
+                                winit::window::CursorIcon::Pointer
+                            } else {
+                                winit::window::CursorIcon::Text
+                            });
                         }
 
                         if pane.parser.mouse_tracking && !is_shift {
-                            if mouse_pressed {
-                                if self.last_cell != Some((curr_col, curr_row)) {
-                                    self.last_cell = Some((curr_col, curr_row));
-                                    self.send_mouse_event(32, curr_col, curr_row, true);
-                                }
+                            if mouse_pressed && self.last_cell != Some((curr_col, curr_row)) {
+                                self.last_cell = Some((curr_col, curr_row));
+                                self.send_mouse_event(32, curr_col, curr_row, true);
                             }
                         } else if mouse_pressed {
                             if let Some((start_col, start_row)) = selection_start {
@@ -2138,12 +2242,28 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
             WindowEvent::MouseInput { state, button, .. } => {
                 use winit::event::MouseButton;
 
-                // Sürükleme bitişi
-                if button == MouseButton::Left && state == ElementState::Released {
-                    if self.drag_state != DragState::None {
-                        self.drag_state = DragState::None;
+                // Açık bir bağlam menüsü varken tıklama işleme
+                if let Some(menu) = self.context_menu.take() {
+                    if state == ElementState::Pressed {
+                        if button == MouseButton::Left {
+                            if let Some(idx) = menu.selected_index {
+                                if let Some(item) = menu.items.get(idx) {
+                                    let action_id = item.id;
+                                    self.execute_command(action_id, event_loop);
+                                }
+                            }
+                        }
+                        if let Some(win) = &self.window {
+                            win.request_redraw();
+                        }
                         return;
                     }
+                }
+
+                // Sürükleme bitişi
+                if button == MouseButton::Left && state == ElementState::Released && self.drag_state != DragState::None {
+                    self.drag_state = DragState::None;
+                    return;
                 }
 
                 let has_header = self.has_header_bar();
@@ -2349,11 +2469,11 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                     .map(|p| p.parser.mouse_tracking)
                     .unwrap_or(false);
 
-                if mouse_tracking && !self.modifiers.shift_key() {
+                // Y1: Sağ tık her zaman Project Terminal bağlam menüsünü açabilsin (veya Shift basılıysa)
+                if mouse_tracking && !self.modifiers.shift_key() && button != MouseButton::Right {
                     let btn_code = match button {
                         MouseButton::Left => 0,
                         MouseButton::Middle => 1,
-                        MouseButton::Right => 2,
                         _ => return,
                     };
                     let is_press = state == ElementState::Pressed;
@@ -2398,7 +2518,72 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                         }
                     }
                 } else if button == MouseButton::Right && state == ElementState::Pressed {
-                    self.paste_from_clipboard();
+                    // Sağ Tık: Modern Bağlam Menüsü Aç
+                    let mut items = Vec::new();
+
+                    // Seçili metin varsa Kopyala seçeneğini ekle
+                    let has_sel = self.active_tab()
+                        .and_then(|t| t.active_pane())
+                        .and_then(|p| p.parser.grid().get_selected_text())
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+
+                    if has_sel {
+                        items.push(ContextMenuItem {
+                            id: "copy_selection",
+                            title: "Kopyala",
+                            shortcut: "Ctrl+Shift+C",
+                        });
+                    }
+
+                    // Yapıştır seçeneği
+                    items.push(ContextMenuItem {
+                        id: "paste_clipboard",
+                        title: "Yapıştır",
+                        shortcut: "Ctrl+Shift+V",
+                    });
+
+                    // Tıklanan hücrede URL varsa "Bağlantıyı Aç" ekle
+                    if let Some(tab) = self.active_tab() {
+                        if let Some(pane) = tab.active_pane() {
+                            if pane.parser.grid().get_url_at(col, row).is_some()
+                                || pane.parser.grid().get_file_target_at(col, row).is_some()
+                            {
+                                items.push(ContextMenuItem {
+                                    id: "open_link_at_cursor",
+                                    title: "Bağlantıyı Aç",
+                                    shortcut: "Tıkla",
+                                });
+                            }
+                        }
+                    }
+
+                    // Panel bölme seçenekleri
+                    items.push(ContextMenuItem {
+                        id: "split_horizontal",
+                        title: "Yatay Böl",
+                        shortcut: "Ctrl+Shift+D",
+                    });
+                    items.push(ContextMenuItem {
+                        id: "split_vertical",
+                        title: "Dikey Böl",
+                        shortcut: "Ctrl+Shift+E",
+                    });
+                    items.push(ContextMenuItem {
+                        id: "clear_screen",
+                        title: "Ekranı Temizle",
+                        shortcut: "Ctrl+L",
+                    });
+
+                    self.context_menu = Some(ContextMenuInfo {
+                        pos: self.last_cursor_pos,
+                        items,
+                        selected_index: None,
+                    });
+
+                    if let Some(win) = &self.window {
+                        win.request_redraw();
+                    }
                 }
             }
             WindowEvent::CursorLeft { .. } => {

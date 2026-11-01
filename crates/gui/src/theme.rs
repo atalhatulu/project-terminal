@@ -111,7 +111,7 @@ pub const ONE_DARK: Theme = Theme {
     name: "one-dark",
     background: (40, 44, 52), // #282c34
     foreground: (171, 178, 191), // #abb2bf
-    cursor: [82.0 / 255.0, 139.0 / 255.0, 255.0 / 255.0, 0.9], // #528bff
+    cursor: [82.0 / 255.0, 139.0 / 255.0, 1.0, 0.9], // #528bff
     palette: [
         (30, 33, 39),     // 0: Black
         (224, 108, 117),  // 1: Red

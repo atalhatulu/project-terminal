@@ -2,10 +2,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SixelImage {
+    pub id: u64,
     pub col: usize,
     pub row: usize,
     pub width: usize,
     pub height: usize,
+    pub rows_spanned: usize,
     pub rgba: Vec<u8>,
 }
 
@@ -29,6 +31,12 @@ pub struct SixelParser {
     pixels: Vec<u8>, // RGBA 4 bytes per pixel
     state: ParseState,
     param_buf: String,
+}
+
+impl Default for SixelParser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SixelParser {
@@ -215,7 +223,7 @@ impl SixelParser {
         self.param_buf.clear();
     }
 
-    pub fn finish(mut self, col: usize, row: usize) -> Option<SixelImage> {
+    pub fn finish(mut self, col: usize, row: usize, cell_height_px: usize) -> Option<SixelImage> {
         if self.state == ParseState::ColorDef {
             self.parse_color_command();
         }
@@ -239,11 +247,17 @@ impl SixelParser {
             }
         }
 
+        static NEXT_SIXEL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_SIXEL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let eff_cell_h = cell_height_px.max(1);
+        let rows_spanned = actual_h.div_ceil(eff_cell_h);
         Some(SixelImage {
+            id,
             col,
             row,
             width: actual_w,
             height: actual_h,
+            rows_spanned,
             rgba: cropped,
         })
     }

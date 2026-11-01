@@ -279,6 +279,11 @@ impl Grid {
         id
     }
 
+    /// Varsayılan ön plan ve arka plan renklerini günceller.
+    ///
+    /// Not: Sadece boşluk (' ') karakterine sahip arka plan hücreleri yeni varsayılan renklerle güncellenir.
+    /// Kullanıcı veya kabuk tarafından açıkça renklendirilmiş (SGR dizileriyle belirlenmiş) metin ve hücreler
+    /// stillerini korumak amacıyla bilerek değiştirilmez.
     pub fn set_default_colors(&mut self, fg: (u8, u8, u8), bg: (u8, u8, u8)) {
         self.default_fg = fg;
         self.default_bg = bg;
@@ -388,155 +393,7 @@ impl Grid {
 
 #[inline]
 pub fn combine_chars(base: char, combining: char) -> Option<char> {
-    match (base, combining) {
-        // Grave (\u{0300})
-        ('a', '\u{0300}') => Some('à'),
-        ('e', '\u{0300}') => Some('è'),
-        ('i', '\u{0300}') => Some('ì'),
-        ('o', '\u{0300}') => Some('ò'),
-        ('u', '\u{0300}') => Some('ù'),
-        ('A', '\u{0300}') => Some('À'),
-        ('E', '\u{0300}') => Some('È'),
-        ('I', '\u{0300}') => Some('Ì'),
-        ('O', '\u{0300}') => Some('Ò'),
-        ('U', '\u{0300}') => Some('Ù'),
-
-        // Acute (\u{0301})
-        ('a', '\u{0301}') => Some('á'),
-        ('c', '\u{0301}') => Some('ć'),
-        ('e', '\u{0301}') => Some('é'),
-        ('i', '\u{0301}') => Some('í'),
-        ('o', '\u{0301}') => Some('ó'),
-        ('u', '\u{0301}') => Some('ú'),
-        ('s', '\u{0301}') => Some('ś'),
-        ('y', '\u{0301}') => Some('ý'),
-        ('z', '\u{0301}') => Some('ź'),
-        ('A', '\u{0301}') => Some('Á'),
-        ('C', '\u{0301}') => Some('Ć'),
-        ('E', '\u{0301}') => Some('É'),
-        ('I', '\u{0301}') => Some('Í'),
-        ('O', '\u{0301}') => Some('Ó'),
-        ('U', '\u{0301}') => Some('Ú'),
-        ('S', '\u{0301}') => Some('Ś'),
-        ('Y', '\u{0301}') => Some('Ý'),
-        ('Z', '\u{0301}') => Some('Ź'),
-
-        // Circumflex (\u{0302})
-        ('a', '\u{0302}') => Some('â'),
-        ('e', '\u{0302}') => Some('ê'),
-        ('i', '\u{0302}') => Some('î'),
-        ('o', '\u{0302}') => Some('ô'),
-        ('u', '\u{0302}') => Some('û'),
-        ('A', '\u{0302}') => Some('Â'),
-        ('E', '\u{0302}') => Some('Ê'),
-        ('I', '\u{0302}') => Some('Î'),
-        ('O', '\u{0302}') => Some('Ô'),
-        ('U', '\u{0302}') => Some('Û'),
-
-        // Tilde (\u{0303})
-        ('a', '\u{0303}') => Some('ã'),
-        ('n', '\u{0303}') => Some('ñ'),
-        ('o', '\u{0303}') => Some('õ'),
-        ('A', '\u{0303}') => Some('Ã'),
-        ('N', '\u{0303}') => Some('Ñ'),
-        ('O', '\u{0303}') => Some('Õ'),
-
-        // Diaeresis / Umlaut (\u{0308})
-        ('a', '\u{0308}') => Some('ä'),
-        ('e', '\u{0308}') => Some('ë'),
-        ('i', '\u{0308}') => Some('ï'),
-        ('o', '\u{0308}') => Some('ö'),
-        ('u', '\u{0308}') => Some('ü'),
-        ('y', '\u{0308}') => Some('ÿ'),
-        ('A', '\u{0308}') => Some('Ä'),
-        ('E', '\u{0308}') => Some('Ë'),
-        ('I', '\u{0308}') => Some('Ï'),
-        ('O', '\u{0308}') => Some('Ö'),
-        ('U', '\u{0308}') => Some('Ü'),
-
-        // Cedilla (\u{0327})
-        ('c', '\u{0327}') => Some('ç'),
-        ('s', '\u{0327}') => Some('ş'),
-        ('C', '\u{0327}') => Some('Ç'),
-        ('S', '\u{0327}') => Some('Ş'),
-
-        // Breve (\u{0306})
-        ('a', '\u{0306}') => Some('ă'),
-        ('g', '\u{0306}') => Some('ğ'),
-        ('A', '\u{0306}') => Some('Ă'),
-        ('G', '\u{0306}') => Some('Ğ'),
-
-        // Ring above (\u{030A})
-        ('a', '\u{030A}') => Some('å'),
-        ('u', '\u{030A}') => Some('ů'),
-        ('A', '\u{030A}') => Some('Å'),
-        ('U', '\u{030A}') => Some('Ů'),
-
-        // Dot above (\u{0307})
-        ('c', '\u{0307}') => Some('ċ'),
-        ('e', '\u{0307}') => Some('ė'),
-        ('g', '\u{0307}') => Some('ġ'),
-        ('i', '\u{0307}') => Some('i'),
-        ('z', '\u{0307}') => Some('ż'),
-        ('C', '\u{0307}') => Some('Ċ'),
-        ('E', '\u{0307}') => Some('Ė'),
-        ('G', '\u{0307}') => Some('Ġ'),
-        ('I', '\u{0307}') => Some('İ'),
-        ('Z', '\u{0307}') => Some('Ż'),
-
-        // Caron / Hacek (\u{030C})
-        ('c', '\u{030C}') => Some('č'),
-        ('d', '\u{030C}') => Some('ď'),
-        ('e', '\u{030C}') => Some('ě'),
-        ('l', '\u{030C}') => Some('ľ'),
-        ('n', '\u{030C}') => Some('ň'),
-        ('r', '\u{030C}') => Some('ř'),
-        ('s', '\u{030C}') => Some('š'),
-        ('t', '\u{030C}') => Some('ť'),
-        ('z', '\u{030C}') => Some('ž'),
-        ('C', '\u{030C}') => Some('Č'),
-        ('D', '\u{030C}') => Some('Ď'),
-        ('E', '\u{030C}') => Some('Ě'),
-        ('L', '\u{030C}') => Some('Ľ'),
-        ('N', '\u{030C}') => Some('Ň'),
-        ('R', '\u{030C}') => Some('Ř'),
-        ('S', '\u{030C}') => Some('Š'),
-        ('T', '\u{030C}') => Some('Ť'),
-        ('Z', '\u{030C}') => Some('Ž'),
-
-        // Macron (\u{0304})
-        ('a', '\u{0304}') => Some('ā'),
-        ('e', '\u{0304}') => Some('ē'),
-        ('i', '\u{0304}') => Some('ī'),
-        ('o', '\u{0304}') => Some('ō'),
-        ('u', '\u{0304}') => Some('ū'),
-        ('A', '\u{0304}') => Some('Ā'),
-        ('E', '\u{0304}') => Some('Ē'),
-        ('I', '\u{0304}') => Some('Ī'),
-        ('O', '\u{0304}') => Some('Ō'),
-        ('U', '\u{0304}') => Some('Ū'),
-
-        // Ogonek (\u{0328})
-        ('a', '\u{0328}') => Some('ą'),
-        ('e', '\u{0328}') => Some('ę'),
-        ('i', '\u{0328}') => Some('į'),
-        ('u', '\u{0328}') => Some('ų'),
-        ('A', '\u{0328}') => Some('Ą'),
-        ('E', '\u{0328}') => Some('Ę'),
-        ('I', '\u{0328}') => Some('Į'),
-        ('U', '\u{0328}') => Some('Ų'),
-
-        // Double acute (\u{030B})
-        ('o', '\u{030B}') => Some('ő'),
-        ('u', '\u{030B}') => Some('ű'),
-        ('O', '\u{030B}') => Some('Ő'),
-        ('U', '\u{030B}') => Some('Ű'),
-
-        // Combining long solidus overlay / slash (\u{0338})
-        ('=', '\u{0338}') => Some('≠'),
-
-        _ => None,
-    }
+    unicode_normalization::char::compose(base, combining)
 }
 
     pub fn put_char(&mut self, c: char) {
@@ -775,13 +632,13 @@ pub fn combine_chars(base: char, combining: char) -> Option<char> {
             }
         }
 
-        // Görsellerin konumlarını yukarı kaydır, ekran dışına çıkanları temizle
+        // Görsellerin konumlarını yukarı kaydır, ekran dışına çıkanları temizle (Y5: img.rows_spanned kullan)
         self.images.retain_mut(|img| {
             if img.row >= n {
                 img.row -= n;
                 true
             } else {
-                let rows_spanned = (img.height + 15) / 16;
+                let rows_spanned = img.rows_spanned;
                 if img.row + rows_spanned > n {
                     img.row = 0;
                     true
@@ -1008,6 +865,9 @@ pub fn combine_chars(base: char, combining: char) -> Option<char> {
                 if c < line_cells.len() && line_cells[c].c != '\0' {
                     line.push(line_cells[c].c);
                 }
+            }
+            if r > s_row {
+                result.push('\n');
             }
             result.push_str(line.trim_end());
         }
@@ -1351,28 +1211,43 @@ pub fn combine_chars(base: char, combining: char) -> Option<char> {
             }
         };
 
-        let q_lower = q.to_lowercase();
         let total_lines = self.scrollback.len() + self.rows;
         let mut matches = Vec::new();
+        // NOT: to_lowercase().next() projeksiyonu 1:1 char eşlemesi varsayar.
+        // "ß" -> "ss" gibi 1:N genişleyen karakterlerde arama eşleşmeyebilir;
+        // bu bilinen bir sınırlandırmadır ve panic üretmez.
+        let q_lower: Vec<char> = q.chars()
+            .map(|c| c.to_lowercase().next().unwrap_or(c)).collect();
 
-        for vidx in 0..total_lines {
-            let line_cells = if vidx < self.scrollback.len() {
-                &self.scrollback[vidx]
-            } else {
-                let r = vidx - self.scrollback.len();
-                let start = r * self.cols;
-                let end = (start + self.cols).min(self.cells.len());
-                &self.cells[start..end]
-            };
-            let line_str: String = line_cells.iter().map(|c| c.c).collect();
-            let line_lower = line_str.to_lowercase();
+        if !q_lower.is_empty() {
+            let q_len = q_lower.len();
+            for vidx in 0..total_lines {
+                let line_cells = if vidx < self.scrollback.len() {
+                    &self.scrollback[vidx]
+                } else {
+                    let r = vidx - self.scrollback.len();
+                    let start = r * self.cols;
+                    let end = (start + self.cols).min(self.cells.len());
+                    &self.cells[start..end]
+                };
+                let line_str: String = line_cells.iter().map(|c| c.c).collect();
+                let line_chars: Vec<char> = line_str.chars().collect();
+                let line_lower: Vec<char> = line_chars.iter()
+                    .map(|c| c.to_lowercase().next().unwrap_or(*c)).collect();
 
-            for (start_idx, _) in line_lower.match_indices(&q_lower) {
-                matches.push(SearchMatch {
-                    virtual_line: vidx,
-                    start_col: start_idx,
-                    end_col: start_idx + q.chars().count(),
-                });
+                if line_lower.len() < q_len {
+                    continue;
+                }
+
+                for i in 0..=(line_lower.len() - q_len) {
+                    if line_lower[i..i + q_len] == q_lower[..] {
+                        matches.push(SearchMatch {
+                            virtual_line: vidx,
+                            start_col: i,
+                            end_col: i + q_len,
+                        });
+                    }
+                }
             }
         }
 

@@ -39,6 +39,7 @@ pub struct CoreParser {
     pub clipboard_store: Option<String>,
     pub keyboard_flags: u32,
     pub keyboard_flags_stack: Vec<u32>,
+    pub cell_height: usize,
 }
 
 impl CoreParser {
@@ -62,7 +63,15 @@ impl CoreParser {
             clipboard_store: None,
             keyboard_flags: 0,
             keyboard_flags_stack: Vec::new(),
+            // Varsayılan 16px. Renderer gerçek hücre yüksekliğini hesapladıktan
+            // sonra set_cell_height() ile override edilmelidir (bkz. gui/main.rs
+            // update_grid_size). Sixel satır yayılımı bu değere bağlıdır.
+            cell_height: 16,
         }
+    }
+
+    pub fn set_cell_height(&mut self, cell_height: usize) {
+        self.cell_height = cell_height.max(1);
     }
 
     pub fn grid(&self) -> &Grid {
@@ -118,6 +127,7 @@ impl CoreParser {
             clipboard_store: &mut self.clipboard_store,
             keyboard_flags: &mut self.keyboard_flags,
             keyboard_flags_stack: &mut self.keyboard_flags_stack,
+            cell_height: self.cell_height,
         };
         self.parser.advance(&mut handler, bytes);
     }
@@ -141,6 +151,7 @@ struct CoreHandler<'a> {
     clipboard_store: &'a mut Option<String>,
     keyboard_flags: &'a mut u32,
     keyboard_flags_stack: &'a mut Vec<u32>,
+    cell_height: usize,
 }
 
 impl<'a> CoreHandler<'a> {
@@ -254,8 +265,8 @@ impl<'a> Perform for CoreHandler<'a> {
         if let Some(p) = self.sixel_parser.take() {
             let col = self.grid().cursor_col;
             let row = self.grid().cursor_row;
-            if let Some(img) = p.finish(col, row) {
-                let rows_spanned = (img.height + 15) / 16;
+            if let Some(img) = p.finish(col, row, self.cell_height) {
+                let rows_spanned = img.rows_spanned;
                 let grid = self.grid();
                 grid.cursor_row = (grid.cursor_row + rows_spanned).min(grid.rows.saturating_sub(1));
                 grid.images.push(img);
@@ -548,6 +559,7 @@ impl<'a> Perform for CoreHandler<'a> {
         } else {
             &mut *self.primary_grid
         };
+        // CSI komutları öncesinde gecikmeli satır kaydırma (DECAWM delayed line wrapping) durumunu sıfırla
         grid.wrap_next = false;
 
         match action {

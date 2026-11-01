@@ -1,13 +1,13 @@
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
 
 use nix::pty::{openpty, Winsize};
-use nix::sys::signal::{signal, SigHandler, Signal};
-use nix::unistd::{close, dup2, execvp, fork, setsid, ForkResult, Pid};
+use nix::sys::signal::Signal;
+use nix::unistd::{dup2, fork, setsid, ForkResult, Pid};
 use std::ffi::CString;
 
 const BASH_INTEGRATION_SCRIPT: &str = include_str!("../../../shell/project-terminal.bash");
@@ -98,6 +98,92 @@ impl Pty {
         let master_fd = pty_pair.master;
         let slave_fd = pty_pair.slave;
 
+        // Fork öncesi hazırlıklar (K1):
+        // POSIX standartlarına göre ortam_degiskenleri ve getenv async-signal-safe DEĞİLDİR.
+        // Bu sebeple tüm ortam değişkenleri (envp), CString dönüşümleri ve mutlak program yolu
+        // fork() çağrısından önce heap üzerinde güvenle hazırlanır.
+        let cwd_c = cwd.and_then(|p| CString::new(p.into_os_string().into_encoded_bytes()).ok());
+
+        let resolve_bin = |prog: &str| -> String {
+            if prog.contains('/') {
+                return prog.to_string();
+            }
+            if let Ok(path_var) = std::env::var("PATH") {
+                for dir in path_var.split(':') {
+                    let p = std::path::Path::new(dir).join(prog);
+                    if p.is_file() {
+                        return p.to_string_lossy().to_string();
+                    }
+                }
+            }
+            prog.to_string()
+        };
+
+        let (exec_prog_c, exec_argv_c) = if let Some(cmd_args) = command {
+            let mut c_args = Vec::new();
+            for arg in cmd_args {
+                if let Ok(c) = CString::new(arg) {
+                    c_args.push(c);
+                }
+            }
+            if let Some(first) = c_args.first().cloned() {
+                let resolved = resolve_bin(&first.to_string_lossy());
+                (CString::new(resolved).unwrap_or(first), c_args)
+            } else {
+                let sh = CString::new("/bin/sh").unwrap();
+                (sh.clone(), vec![sh])
+            }
+        } else {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+            let integration_script = resolve_shell_integration_script();
+            let mut bash_args = Vec::new();
+
+            if let Some(script) = integration_script {
+                if shell.ends_with("bash") {
+                    if let Some(script_str) = script.to_str() {
+                        bash_args.push(CString::new(shell.clone()).unwrap());
+                        bash_args.push(CString::new("--init-file").unwrap());
+                        bash_args.push(CString::new(script_str).unwrap());
+                    } else {
+                        bash_args.push(CString::new(shell.clone()).unwrap());
+                    }
+                } else {
+                    bash_args.push(CString::new(shell.clone()).unwrap());
+                }
+            } else {
+                bash_args.push(CString::new(shell.clone()).unwrap());
+            }
+
+            let resolved = resolve_bin(&shell);
+            let shell_c = CString::new(resolved).unwrap_or_else(|_| CString::new(shell).unwrap());
+            (shell_c, bash_args)
+        };
+
+        // Mevcut ortam değişkenlerini topla ve Project Terminal değişkenleriyle harmanla
+        let mut env_map = std::collections::HashMap::new();
+        for (k, v) in std::env::vars() {
+            env_map.insert(k, v);
+        }
+        env_map.insert("TERM".to_string(), "xterm-256color".to_string());
+        env_map.insert("COLORTERM".to_string(), "truecolor".to_string());
+        env_map.insert("TERMINAL".to_string(), "project-terminal".to_string());
+        env_map.insert("TERM_PROGRAM".to_string(), "project-terminal".to_string());
+        env_map.insert("TERM_PROGRAM_VERSION".to_string(), "0.1.0".to_string());
+
+        let mut envp_c = Vec::new();
+        for (k, v) in env_map {
+            if let Ok(entry) = CString::new(format!("{}={}", k, v)) {
+                envp_c.push(entry);
+            }
+        }
+
+        // argv ve envp için ham C işaretçi dizileri (NULL ile sonlanan)
+        let mut argv_ptrs: Vec<*const libc::c_char> = exec_argv_c.iter().map(|s| s.as_ptr()).collect();
+        argv_ptrs.push(std::ptr::null());
+
+        let mut envp_ptrs: Vec<*const libc::c_char> = envp_c.iter().map(|s| s.as_ptr()).collect();
+        envp_ptrs.push(std::ptr::null());
+
         match unsafe { fork() } {
             Ok(ForkResult::Parent { child }) => {
                 // Ebeveyn süreç: Slave FD'yi kapat
@@ -122,7 +208,14 @@ impl Pty {
                                     break;
                                 }
                             }
-                            Err(_) => break,
+                            Err(e) => {
+                                // EIO (Input/output error) Linux PTY slave kapandığında olağan bir durumdur (O8).
+                                // Diğer beklenmedik I/O hataları için tracing ile bilgi kaydedilir.
+                                if e.raw_os_error() != Some(libc::EIO) {
+                                    tracing::debug!("PTY master read ended: {:?}", e);
+                                }
+                                break;
+                            }
                         }
                     }
                 });
@@ -137,81 +230,51 @@ impl Pty {
                 ))
             }
             Ok(ForkResult::Child) => {
+                // K3: OwnedFd çifte kapanma (double-close) riskini önlemek için ham FD al
+                let s_raw = slave_fd.into_raw_fd();
+                let m_raw = master_fd.into_raw_fd();
+
                 // Çocuk süreç: Yeni oturum başlat
                 let _ = setsid();
 
-                if let Some(ref d) = cwd {
-                    let _ = std::env::set_current_dir(d);
+                if let Some(ref d) = cwd_c {
+                    unsafe { libc::chdir(d.as_ptr()) };
                 }
 
                 unsafe {
                     // Ebeveyn süreç çökerse veya kapanırsa çekirdeğin çocuğu sonlandırmasını sağla
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGHUP as libc::c_ulong, 0, 0, 0);
 
-                    // SIGCHLD ve diğer sinyalleri varsayılana çek
-                    let _ = signal(Signal::SIGCHLD, SigHandler::SigDfl);
+                    // SIGCHLD ve diğer sinyalleri varsayılana çek (sigaction ile, signal değil)
+                    let mut sa: libc::sigaction = std::mem::zeroed();
+                    sa.sa_sigaction = libc::SIG_DFL;
+                    libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut());
 
-                    // PTY slave'i kontrol terminali yap (TIOCSCTTY)
-                    libc::ioctl(slave_fd.as_raw_fd(), libc::TIOCSCTTY, 0);
+                    // PTY slave kontrol terminali yap (TIOCSCTTY)
+                    libc::ioctl(s_raw, libc::TIOCSCTTY, 0);
 
-                    // stdin, stdout, stderr'i slave_fd'ye yönlendir
-                    let s_raw = slave_fd.as_raw_fd();
+                    // stdin, stdout, stderr slave_fd ye yönlendir
                     let _ = dup2(s_raw, 0);
                     let _ = dup2(s_raw, 1);
                     let _ = dup2(s_raw, 2);
 
                     if s_raw > 2 {
-                        let _ = close(s_raw);
+                        libc::close(s_raw);
                     }
-                    let _ = close(master_fd.as_raw_fd());
+                    libc::close(m_raw);
                 }
 
-                // Ortam değişkenlerini hazırla
-                std::env::set_var("TERM", "xterm-256color");
-                std::env::set_var("COLORTERM", "truecolor");
-                std::env::set_var("TERMINAL", "project-terminal");
-                std::env::set_var("TERM_PROGRAM", "project-terminal");
-                std::env::set_var("TERM_PROGRAM_VERSION", "0.1.0");
-
-                // Özel bir komut verildiyse (örn: project-terminal -e htop) doğrudan çalıştır
-                if let Some(cmd_args) = command {
-                    if let Some(first) = cmd_args.first() {
-                        let c_prog = CString::new(first.clone()).unwrap();
-                        let c_args: Vec<CString> = cmd_args
-                            .iter()
-                            .map(|s| CString::new(s.clone()).unwrap())
-                            .collect();
-                        let _ = execvp(&c_prog, &c_args);
-                    }
-                    std::process::exit(1);
-                }
-
-                // OSC 133 Shell Entegrasyon Betiğini bul ve BASH_ENV/ENV içine ekle
-                let mut bash_args = Vec::new();
-                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-
-                let integration_script = resolve_shell_integration_script();
-
-                if let Some(script) = integration_script {
-                    if shell.ends_with("bash") {
-                        if let Some(script_str) = script.to_str() {
-                            std::env::set_var("BASH_ENV", script_str);
-                            bash_args.push(CString::new(shell.clone()).unwrap());
-                            bash_args.push(CString::new("--init-file").unwrap());
-                            bash_args.push(CString::new(script_str).unwrap());
-                        } else {
-                            bash_args.push(CString::new(shell.clone()).unwrap());
-                        }
-                    } else {
-                        bash_args.push(CString::new(shell.clone()).unwrap());
-                    }
-                } else {
-                    bash_args.push(CString::new(shell.clone()).unwrap());
-                }
-
-                let shell_c = CString::new(shell.clone()).unwrap();
-                let _ = execvp(&shell_c, &bash_args);
-                std::process::exit(1);
+                // K1: execve doğrudan POSIX async-signal-safe bir sistem çağrısıdır.
+                // ortam_degiskenleri/getenv çağırmadan önceden hazırlanmış envp dizisi doğrudan aktarılır.
+                unsafe {
+                    libc::execve(
+                        exec_prog_c.as_ptr(),
+                        argv_ptrs.as_ptr(),
+                        envp_ptrs.as_ptr(),
+                    );
+                    // K2: atexit handler tetikleyen std::process::exit(1) yerine libc::_exit(127) convention
+                    libc::_exit(127);
+                };
             }
             Err(_) => Err(PtyError::ForkFailed),
         }
@@ -334,4 +397,3 @@ mod tests {
         assert!(path.exists());
     }
 }
-
