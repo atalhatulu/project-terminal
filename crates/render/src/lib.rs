@@ -1309,7 +1309,7 @@ impl TerminalRenderer {
                             );
                         }
 
-                        // Ana blok gövdesi (hafif yuvarlak köşeli etki veren dolgun gövde)
+                        // Ana blok gövdesi
                         push_quad(
                             &mut bg_vertices,
                             cx,
@@ -1318,32 +1318,6 @@ impl TerminalRenderer {
                             self.cell_height,
                             cursor_color,
                         );
-
-                        // Maskot Pet Gözleri: Blok imlecin içinde iki sevimli piksel göz
-                        // Periyodik göz kırpma (Blink: her ~3.5 saniyede bir 180ms kırpma)
-                        let blink_cycle = now_ms % 3500;
-                        let is_eye_blinking = blink_cycle > 3300;
-
-                        // Hareket yönüne göre bakış yönü (Look direction):
-                        // Sağa doğru hızlı hareket ederken gözler hafif sağa, sola giderken sola kayar
-                        let look_offset_x = if self.cursor_velocity_x > 20.0 {
-                            1.0
-                        } else if self.cursor_velocity_x < -20.0 {
-                            -1.0
-                        } else {
-                            0.0
-                        };
-
-                        let eye_color = [15.0 / 255.0, 18.0 / 255.0, 26.0 / 255.0, 1.0];
-                        let eye_w = 2.0;
-                        let eye_h = if is_eye_blinking { 1.0 } else { 3.0 };
-
-                        let left_eye_x = (cx + self.cell_width * 0.28 + look_offset_x).round();
-                        let right_eye_x = (cx + self.cell_width * 0.62 + look_offset_x).round();
-                        let eye_y = (cy + self.cell_height * 0.38).round();
-
-                        push_quad(&mut bg_vertices, left_eye_x, eye_y, eye_w, eye_h, eye_color);
-                        push_quad(&mut bg_vertices, right_eye_x, eye_y, eye_w, eye_h, eye_color);
                     }
                     CursorShape::Beam => {
                         push_quad(
