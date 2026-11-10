@@ -178,6 +178,9 @@ pub struct SavedCursor {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    pub underline_style: crate::cell::UnderlineStyle,
+    pub underline_color: Option<(u8, u8, u8)>,
+    pub strikethrough: bool,
     pub dim: bool,
     pub inverse: bool,
 }
@@ -199,6 +202,9 @@ pub struct Grid {
     pub current_bold: bool,
     pub current_italic: bool,
     pub current_underline: bool,
+    pub current_underline_style: crate::cell::UnderlineStyle,
+    pub current_underline_color: Option<(u8, u8, u8)>,
+    pub current_strikethrough: bool,
     pub current_dim: bool,
     pub current_inverse: bool,
     pub saved_cursor: Option<SavedCursor>,
@@ -219,7 +225,9 @@ pub struct Grid {
     pub version: u64,
     pub current_hyperlink_id: Option<u32>,
     pub hyperlinks: std::collections::HashMap<u32, String>,
+    pub hyperlink_fifo: std::collections::VecDeque<u32>,
     pub next_hyperlink_id: u32,
+    pub empty_row: Vec<Cell>,
 }
 
 impl Grid {
@@ -242,6 +250,9 @@ impl Grid {
             current_bold: false,
             current_italic: false,
             current_underline: false,
+            current_underline_style: crate::cell::UnderlineStyle::None,
+            current_underline_color: None,
+            current_strikethrough: false,
             current_dim: false,
             current_inverse: false,
             saved_cursor: None,
@@ -262,7 +273,9 @@ impl Grid {
             version: 1,
             current_hyperlink_id: None,
             hyperlinks: std::collections::HashMap::new(),
+            hyperlink_fifo: std::collections::VecDeque::new(),
             next_hyperlink_id: 1,
+            empty_row: vec![Cell::default(); cols],
         }
     }
 
@@ -270,10 +283,12 @@ impl Grid {
         let id = self.next_hyperlink_id;
         self.next_hyperlink_id = self.next_hyperlink_id.wrapping_add(1).max(1);
         self.hyperlinks.insert(id, url);
+        self.hyperlink_fifo.push_back(id);
         if self.hyperlinks.len() > 1024 {
-            let keys_to_remove: Vec<u32> = self.hyperlinks.keys().take(128).copied().collect();
-            for k in keys_to_remove {
-                self.hyperlinks.remove(&k);
+            for _ in 0..128 {
+                if let Some(old_id) = self.hyperlink_fifo.pop_front() {
+                    self.hyperlinks.remove(&old_id);
+                }
             }
         }
         id
@@ -338,7 +353,7 @@ impl Grid {
             let line_cells = self.get_display_line(r);
             damage.push(LineDamage {
                 row: r,
-                cells: line_cells,
+                cells: line_cells.to_vec(),
             });
         }
         damage
@@ -348,7 +363,7 @@ impl Grid {
         let mut lines = Vec::with_capacity(self.rows);
         for r in 0..self.rows {
             let line_cells = self.get_display_line(r);
-            lines.push(line_cells);
+            lines.push(line_cells.to_vec());
         }
         GridSnapshot {
             cols: self.cols,
@@ -381,6 +396,7 @@ impl Grid {
         self.cols = cols;
         self.rows = rows;
         self.cells = new_cells;
+        self.empty_row = vec![Cell::default(); cols];
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.selection = None;
@@ -405,7 +421,7 @@ pub fn combine_chars(base: char, combining: char) -> Option<char> {
 
         let width = c.width().unwrap_or(1);
         if width == 0 {
-            // Sıfır genişlikli birleşik karakter (combining character / diacritic):
+            // Sıfır genişlikli birleşik karakter (combining character / diacritic / ZWJ):
             // İmleci ilerletmeden önceki hücrenin üzerine ekleme / birleştirme yap
             if self.cursor_col > 0 {
                 let prev_col = self.cursor_col - 1;
@@ -417,7 +433,10 @@ pub fn combine_chars(base: char, combining: char) -> Option<char> {
                         prev_idx
                     };
                     let prev_c = self.cells[target_idx].c;
-                    if let Some(composed) = Self::combine_chars(prev_c, c) {
+                    if c == '\u{200D}' {
+                        // ZWJ: Önceki hücreyi kirli işaretle, bir sonraki karakterle birleşmeyi destekle
+                        self.mark_line_dirty(self.cursor_row);
+                    } else if let Some(composed) = Self::combine_chars(prev_c, c) {
                         self.cells[target_idx].c = composed;
                         self.mark_line_dirty(self.cursor_row);
                     }
@@ -432,43 +451,39 @@ pub fn combine_chars(base: char, combining: char) -> Option<char> {
             self.wrap_next = false;
         }
 
-        let b_id = self.current_block_id.and_then(std::num::NonZeroU32::new);
-        let h_id = self.current_hyperlink_id.and_then(std::num::NonZeroU32::new);
+        let b_id = self.current_block_id.and_then(|id| std::num::NonZeroU16::new(id as u16));
+        let h_id = self.current_hyperlink_id.and_then(|id| std::num::NonZeroU16::new(id as u16));
         let is_out = self.in_command_output && self.current_block_id.is_some();
+
+        let mut cell = Cell {
+            c,
+            fg: self.current_fg,
+            bg: self.current_bg,
+            bold: self.current_bold,
+            italic: self.current_italic,
+            underline: self.current_underline,
+            underline_style: self.current_underline_style,
+            underline_color: None,
+            strikethrough: self.current_strikethrough,
+            dim: self.current_dim,
+            inverse: self.current_inverse,
+            is_output: is_out,
+            block_id: b_id,
+            hyperlink_id: h_id,
+        };
+        cell.set_underline_color_rgb(self.current_underline_color);
 
         let idx = self.cursor_row * self.cols + self.cursor_col;
         if idx < self.cells.len() {
-            self.cells[idx] = Cell {
-                c,
-                fg: self.current_fg,
-                bg: self.current_bg,
-                bold: self.current_bold,
-                italic: self.current_italic,
-                underline: self.current_underline,
-                dim: self.current_dim,
-                inverse: self.current_inverse,
-                is_output: is_out,
-                block_id: b_id,
-                hyperlink_id: h_id,
-            };
+            self.cells[idx] = cell;
         }
 
         if width == 2 && self.cursor_col + 1 < self.cols {
             let next_idx = self.cursor_row * self.cols + self.cursor_col + 1;
             if next_idx < self.cells.len() {
-                self.cells[next_idx] = Cell {
-                    c: '\0',
-                    fg: self.current_fg,
-                    bg: self.current_bg,
-                    bold: self.current_bold,
-                    italic: self.current_italic,
-                    underline: self.current_underline,
-                    dim: self.current_dim,
-                    inverse: self.current_inverse,
-                    is_output: is_out,
-                    block_id: b_id,
-                    hyperlink_id: h_id,
-                };
+                let mut next_cell = cell;
+                next_cell.c = '\0';
+                self.cells[next_idx] = next_cell;
             }
         }
 
@@ -540,6 +555,9 @@ pub fn combine_chars(base: char, combining: char) -> Option<char> {
             bold: self.current_bold,
             italic: self.current_italic,
             underline: self.current_underline,
+            underline_style: self.current_underline_style,
+            underline_color: self.current_underline_color,
+            strikethrough: self.current_strikethrough,
             dim: self.current_dim,
             inverse: self.current_inverse,
         });
@@ -554,6 +572,9 @@ pub fn combine_chars(base: char, combining: char) -> Option<char> {
             self.current_bold = saved.bold;
             self.current_italic = saved.italic;
             self.current_underline = saved.underline;
+            self.current_underline_style = saved.underline_style;
+            self.current_underline_color = saved.underline_color;
+            self.current_strikethrough = saved.strikethrough;
             self.current_dim = saved.dim;
             self.current_inverse = saved.inverse;
         }
@@ -632,18 +653,23 @@ pub fn combine_chars(base: char, combining: char) -> Option<char> {
             }
         }
 
-        // Görsellerin konumlarını yukarı kaydır, ekran dışına çıkanları temizle (Y5: img.rows_spanned kullan)
+        // Görsellerin konumlarını yukarı kaydır, ekran dışına çıkanları temizle
         self.images.retain_mut(|img| {
-            if img.row >= n {
+            if img.row < top || img.row > bottom {
+                return true;
+            }
+            if img.row >= top + n {
                 img.row -= n;
                 true
             } else {
-                let rows_spanned = img.rows_spanned;
-                if img.row + rows_spanned > n {
-                    img.row = 0;
-                    true
-                } else {
+                let passed = (top + n) - img.row;
+                if img.rows_spanned <= passed {
                     false
+                } else {
+                    img.rows_spanned -= passed;
+                    img.top_offset_rows += passed;
+                    img.row = top;
+                    true
                 }
             }
         });
@@ -685,6 +711,21 @@ pub fn combine_chars(base: char, combining: char) -> Option<char> {
                 }
             }
         }
+
+        // Görsellerin konumlarını aşağı kaydır
+        self.images.retain_mut(|img| {
+            if img.row < top || img.row > bottom {
+                return true;
+            }
+            img.row += n;
+            if img.row > bottom {
+                return false;
+            }
+            if img.row + img.rows_spanned > bottom + 1 {
+                img.rows_spanned = (bottom + 1).saturating_sub(img.row);
+            }
+            img.rows_spanned > 0
+        });
 
         self.mark_all_dirty();
     }
@@ -817,14 +858,14 @@ pub fn combine_chars(base: char, combining: char) -> Option<char> {
         self.mark_all_dirty();
     }
 
-    pub fn get_display_line(&self, r: usize) -> Vec<Cell> {
+    pub fn get_display_line(&self, r: usize) -> &[Cell] {
         if self.scroll_offset == 0 {
             let start = r * self.cols;
             let end = start + self.cols;
             if end <= self.cells.len() {
-                return self.cells[start..end].to_vec();
+                return &self.cells[start..end];
             }
-            return vec![Cell::default(); self.cols];
+            return &self.empty_row;
         }
 
         let total_scroll = self.scrollback.len();
@@ -832,17 +873,17 @@ pub fn combine_chars(base: char, combining: char) -> Option<char> {
         let target_idx = virtual_top + r;
 
         if target_idx < total_scroll {
-            self.scrollback[target_idx].clone()
+            &self.scrollback[target_idx]
         } else {
             let active_r = target_idx - total_scroll;
             if active_r < self.rows {
                 let start = active_r * self.cols;
                 let end = start + self.cols;
                 if end <= self.cells.len() {
-                    return self.cells[start..end].to_vec();
+                    return &self.cells[start..end];
                 }
             }
-            vec![Cell::default(); self.cols]
+            &self.empty_row
         }
     }
 

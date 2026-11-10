@@ -8,6 +8,8 @@ pub struct SixelImage {
     pub width: usize,
     pub height: usize,
     pub rows_spanned: usize,
+    #[serde(default)]
+    pub top_offset_rows: usize,
     pub rgba: Vec<u8>,
 }
 
@@ -258,6 +260,7 @@ impl SixelParser {
             width: actual_w,
             height: actual_h,
             rows_spanned,
+            top_offset_rows: 0,
             rgba: cropped,
         })
     }

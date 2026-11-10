@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub struct FontConfig {
     pub size: Option<f32>,
     pub family: Option<String>,
+    pub fallback_families: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -84,6 +85,13 @@ impl Config {
             .as_ref()
             .and_then(|f| f.family.clone())
             .filter(|fam| fam != "monospace")
+    }
+
+    pub fn fallback_families(&self) -> Vec<String> {
+        self.font
+            .as_ref()
+            .and_then(|f| f.fallback_families.clone())
+            .unwrap_or_default()
     }
 
     pub fn cursor_shape(&self) -> Option<term_core::CursorShape> {

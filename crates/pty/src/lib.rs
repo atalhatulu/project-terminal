@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
 
@@ -195,16 +195,18 @@ impl Pty {
                     unsafe { File::from_raw_fd(nix::unistd::dup(master_raw)?) };
 
                 let writer = Arc::new(Mutex::new(master_file_write));
-                let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = channel();
+                let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = sync_channel(32);
 
                 // Non-blocking PTY okuyucu thread'i
                 thread::spawn(move || {
-                    let mut buf = [0u8; 8192];
+                    let mut chunk = vec![0u8; 8192];
                     loop {
-                        match master_file_read.read(&mut buf) {
+                        match master_file_read.read(&mut chunk) {
                             Ok(0) => break, // EOF
                             Ok(n) => {
-                                if tx.send(buf[..n].to_vec()).is_err() {
+                                chunk.truncate(n);
+                                let to_send = std::mem::replace(&mut chunk, vec![0u8; 8192]);
+                                if tx.send(to_send).is_err() {
                                     break;
                                 }
                             }
@@ -396,4 +398,17 @@ mod tests {
         let path = script.unwrap();
         assert!(path.exists());
     }
+
+    #[test]
+    fn test_pty_sync_channel_backpressure() {
+        // Bounded sync_channel(32) testi: receiver düşürüldüğünde veya tıkandığında
+        // okuyucu thread'in güvenle sonlanması ve PTY'nin sorunsuz kapanması
+        let (pty, rx) = Pty::spawn(80, 24, Some(vec!["echo".to_string(), "backpressure_test".to_string()]), None)
+            .expect("PTY açılabilmeli");
+        let chunk = rx.recv().expect("İlk veri paketi gelmeli");
+        assert!(!chunk.is_empty());
+        drop(rx);
+        drop(pty);
+    }
 }
+

@@ -39,6 +39,10 @@ pub struct CoreParser {
     pub clipboard_store: Option<String>,
     pub keyboard_flags: u32,
     pub keyboard_flags_stack: Vec<u32>,
+    pub primary_keyboard_flags: u32,
+    pub primary_keyboard_flags_stack: Vec<u32>,
+    pub alt_keyboard_flags: u32,
+    pub alt_keyboard_flags_stack: Vec<u32>,
     pub cell_height: usize,
 }
 
@@ -63,6 +67,10 @@ impl CoreParser {
             clipboard_store: None,
             keyboard_flags: 0,
             keyboard_flags_stack: Vec::new(),
+            primary_keyboard_flags: 0,
+            primary_keyboard_flags_stack: Vec::new(),
+            alt_keyboard_flags: 0,
+            alt_keyboard_flags_stack: Vec::new(),
             // Varsayılan 16px. Renderer gerçek hücre yüksekliğini hesapladıktan
             // sonra set_cell_height() ile override edilmelidir (bkz. gui/main.rs
             // update_grid_size). Sixel satır yayılımı bu değere bağlıdır.
@@ -125,6 +133,10 @@ impl CoreParser {
             palette: &self.palette,
             sixel_parser: &mut self.sixel_parser,
             clipboard_store: &mut self.clipboard_store,
+            primary_keyboard_flags: &mut self.primary_keyboard_flags,
+            primary_keyboard_flags_stack: &mut self.primary_keyboard_flags_stack,
+            alt_keyboard_flags: &mut self.alt_keyboard_flags,
+            alt_keyboard_flags_stack: &mut self.alt_keyboard_flags_stack,
             keyboard_flags: &mut self.keyboard_flags,
             keyboard_flags_stack: &mut self.keyboard_flags_stack,
             cell_height: self.cell_height,
@@ -149,6 +161,10 @@ struct CoreHandler<'a> {
     palette: &'a [(u8, u8, u8); 16],
     sixel_parser: &'a mut Option<crate::sixel::SixelParser>,
     clipboard_store: &'a mut Option<String>,
+    primary_keyboard_flags: &'a mut u32,
+    primary_keyboard_flags_stack: &'a mut Vec<u32>,
+    alt_keyboard_flags: &'a mut u32,
+    alt_keyboard_flags_stack: &'a mut Vec<u32>,
     keyboard_flags: &'a mut u32,
     keyboard_flags_stack: &'a mut Vec<u32>,
     cell_height: usize,
@@ -162,6 +178,35 @@ impl<'a> CoreHandler<'a> {
         } else {
             self.primary_grid
         }
+    }
+
+    #[inline]
+    fn active_keyboard_flags(&mut self) -> &mut u32 {
+        if *self.use_alt {
+            self.alt_keyboard_flags
+        } else {
+            self.primary_keyboard_flags
+        }
+    }
+
+    #[inline]
+    fn active_keyboard_flags_stack(&mut self) -> &mut Vec<u32> {
+        if *self.use_alt {
+            self.alt_keyboard_flags_stack
+        } else {
+            self.primary_keyboard_flags_stack
+        }
+    }
+
+    #[inline]
+    fn sync_active_keyboard_flags(&mut self) {
+        let (flags, stack) = if *self.use_alt {
+            (*self.alt_keyboard_flags, self.alt_keyboard_flags_stack.clone())
+        } else {
+            (*self.primary_keyboard_flags, self.primary_keyboard_flags_stack.clone())
+        };
+        *self.keyboard_flags = flags;
+        *self.keyboard_flags_stack = stack;
     }
 }
 
@@ -429,6 +474,7 @@ impl<'a> Perform for CoreHandler<'a> {
                             self.alt_grid.cursor_row = 0;
                             self.alt_grid.cursor_visible = true;
                         }
+                        self.sync_active_keyboard_flags();
                     }
                     2004 => *self.bracketed_paste = action == 'h',
                     2026 => {
@@ -506,33 +552,67 @@ impl<'a> Perform for CoreHandler<'a> {
             return;
         }
 
-        // Kitty Keyboard Protocol (CSI > flags u, CSI < u, CSI = flags ; mode u, CSI ? u)
+        // Kitty Keyboard Protocol (CSI > flags ; mode u, CSI < count u, CSI = flags ; mode u, CSI ? u)
         if action == 'u' {
             if intermediates == b">" {
-                // CSI > flags u : Push and set keyboard flags
-                let flags = params.iter().next().and_then(|p| p.first()).copied().unwrap_or(0) as u32;
-                self.keyboard_flags_stack.push(*self.keyboard_flags);
-                *self.keyboard_flags = flags;
+                // CSI > flags ; mode u : Push and set keyboard flags
+                let mut iter = params.iter();
+                let flags = iter.next().and_then(|p| p.first()).copied().unwrap_or(0) as u32;
+                let mode = iter.next().and_then(|p| p.first()).copied().unwrap_or(1);
+
+                let stack = self.active_keyboard_flags_stack();
+                if stack.len() >= 32 {
+                    stack.remove(0);
+                }
+                let cur = *self.active_keyboard_flags();
+                self.active_keyboard_flags_stack().push(cur);
+
+                let active_flags = self.active_keyboard_flags();
+                match mode {
+                    2 => *active_flags |= flags,
+                    3 => *active_flags &= !flags,
+                    _ => *active_flags = flags,
+                }
+                self.sync_active_keyboard_flags();
                 return;
             } else if intermediates == b"<" {
                 // CSI < count u : Pop keyboard flags
                 let count = params.iter().next().and_then(|p| p.first()).copied().unwrap_or(1).max(1) as usize;
+                let stack = self.active_keyboard_flags_stack();
+                let mut last = None;
                 for _ in 0..count {
-                    if let Some(prev) = self.keyboard_flags_stack.pop() {
-                        *self.keyboard_flags = prev;
+                    if let Some(prev) = stack.pop() {
+                        last = Some(prev);
                     } else {
-                        *self.keyboard_flags = 0;
+                        last = Some(0);
+                        break;
                     }
                 }
+                if let Some(prev) = last {
+                    *self.active_keyboard_flags() = prev;
+                }
+                self.sync_active_keyboard_flags();
                 return;
             } else if intermediates == b"=" {
                 // CSI = flags ; mode u : Set/replace keyboard flags
-                let flags = params.iter().next().and_then(|p| p.first()).copied().unwrap_or(0) as u32;
-                *self.keyboard_flags = flags;
+                // mode 1: replace (default)
+                // mode 2: set bits (union)
+                // mode 3: clear bits (mask out)
+                let mut iter = params.iter();
+                let flags = iter.next().and_then(|p| p.first()).copied().unwrap_or(0) as u32;
+                let mode = iter.next().and_then(|p| p.first()).copied().unwrap_or(1);
+                let active_flags = self.active_keyboard_flags();
+                match mode {
+                    2 => *active_flags |= flags,
+                    3 => *active_flags &= !flags,
+                    _ => *active_flags = flags,
+                }
+                self.sync_active_keyboard_flags();
                 return;
             } else if intermediates == b"?" {
                 // CSI ? u : Query current keyboard flags -> response: CSI ? flags u
-                self.responses.push(format!("\x1b[?{}u", *self.keyboard_flags).into_bytes());
+                let flags = *self.active_keyboard_flags();
+                self.responses.push(format!("\x1b[?{}u", flags).into_bytes());
                 return;
             }
         }
@@ -551,6 +631,32 @@ impl<'a> Perform for CoreHandler<'a> {
                 5 | 6 => self.grid().cursor_shape = crate::grid::CursorShape::Beam,
                 _ => self.grid().cursor_shape = crate::grid::CursorShape::Block,
             }
+            return;
+        }
+
+        // DECSTR: Yumuşak Terminal Sıfırlama (Soft Terminal Reset - CSI ! p)
+        if intermediates == b"!" && action == 'p' {
+            let grid = self.grid();
+            grid.cursor_visible = true;
+            grid.cursor_shape = crate::grid::CursorShape::Block;
+            grid.scroll_region_top = 0;
+            grid.scroll_region_bottom = grid.rows.saturating_sub(1);
+            grid.current_fg = grid.default_fg;
+            grid.current_bg = grid.default_bg;
+            grid.current_bold = false;
+            grid.current_italic = false;
+            grid.current_underline = false;
+            grid.current_underline_style = crate::cell::UnderlineStyle::None;
+            grid.current_underline_color = None;
+            grid.current_strikethrough = false;
+            grid.current_dim = false;
+            grid.current_inverse = false;
+            grid.saved_cursor = None;
+            grid.wrap_next = false;
+            *self.app_cursor_keys = false;
+            *self.bracketed_paste = false;
+            *self.mouse_tracking = false;
+            *self.mouse_sgr = false;
             return;
         }
 
@@ -783,6 +889,67 @@ impl<'a> Perform for CoreHandler<'a> {
                 grid.cursor_col = 0;
             }
             'm' => {
+                // Check if any subparams exist across params (e.g. 4:3 for curly underline, 58:2::r:g:b for underline color)
+                let has_subparams = params.iter().any(|p| p.len() > 1);
+                if has_subparams {
+                    for param in params.iter() {
+                        if param.is_empty() {
+                            continue;
+                        }
+                        match param[0] {
+                            4 => {
+                                if param.len() > 1 {
+                                    match param[1] {
+                                        0 => {
+                                            grid.current_underline = false;
+                                            grid.current_underline_style = crate::cell::UnderlineStyle::None;
+                                        }
+                                        1 => {
+                                            grid.current_underline = true;
+                                            grid.current_underline_style = crate::cell::UnderlineStyle::Single;
+                                        }
+                                        2 => {
+                                            grid.current_underline = true;
+                                            grid.current_underline_style = crate::cell::UnderlineStyle::Double;
+                                        }
+                                        3 => {
+                                            grid.current_underline = true;
+                                            grid.current_underline_style = crate::cell::UnderlineStyle::Curly;
+                                        }
+                                        4 => {
+                                            grid.current_underline = true;
+                                            grid.current_underline_style = crate::cell::UnderlineStyle::Dotted;
+                                        }
+                                        5 => {
+                                            grid.current_underline = true;
+                                            grid.current_underline_style = crate::cell::UnderlineStyle::Dashed;
+                                        }
+                                        _ => {
+                                            grid.current_underline = true;
+                                            grid.current_underline_style = crate::cell::UnderlineStyle::Single;
+                                        }
+                                    }
+                                } else {
+                                    grid.current_underline = true;
+                                    grid.current_underline_style = crate::cell::UnderlineStyle::Single;
+                                }
+                            }
+                            58 => {
+                                if param.len() >= 5 && param[1] == 2 {
+                                    grid.current_underline_color = Some((
+                                        param[param.len() - 3] as u8,
+                                        param[param.len() - 2] as u8,
+                                        param[param.len() - 1] as u8,
+                                    ));
+                                } else if param.len() >= 3 && param[1] == 5 {
+                                    grid.current_underline_color = Some(palette_ansi_256(self.palette, param[2] as u8));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 let mut values = Vec::new();
                 for param in params.iter() {
                     for val in param {
@@ -804,21 +971,38 @@ impl<'a> Perform for CoreHandler<'a> {
                             grid.current_bold = false;
                             grid.current_italic = false;
                             grid.current_underline = false;
+                            grid.current_underline_style = crate::cell::UnderlineStyle::None;
+                            grid.current_underline_color = None;
+                            grid.current_strikethrough = false;
                             grid.current_dim = false;
                             grid.current_inverse = false;
                         }
                         1 => grid.current_bold = true,
                         2 => grid.current_dim = true,
                         3 => grid.current_italic = true,
-                        4 => grid.current_underline = true,
+                        4 => {
+                            grid.current_underline = true;
+                            if grid.current_underline_style == crate::cell::UnderlineStyle::None {
+                                grid.current_underline_style = crate::cell::UnderlineStyle::Single;
+                            }
+                        }
                         7 => grid.current_inverse = true,
+                        9 => grid.current_strikethrough = true,
+                        21 => {
+                            grid.current_underline = true;
+                            grid.current_underline_style = crate::cell::UnderlineStyle::Double;
+                        }
                         22 => {
                             grid.current_bold = false;
                             grid.current_dim = false;
                         }
                         23 => grid.current_italic = false,
-                        24 => grid.current_underline = false,
+                        24 => {
+                            grid.current_underline = false;
+                            grid.current_underline_style = crate::cell::UnderlineStyle::None;
+                        }
                         27 => grid.current_inverse = false,
+                        29 => grid.current_strikethrough = false,
                         30..=37 => grid.current_fg = palette_ansi_16_fg(palette, val as u8 - 30),
                         38 => {
                             if i + 4 < values.len() && values[i + 1] == 2 {
@@ -849,6 +1033,20 @@ impl<'a> Perform for CoreHandler<'a> {
                             }
                         }
                         49 => grid.current_bg = grid.default_bg,
+                        58 => {
+                            if i + 4 < values.len() && values[i + 1] == 2 {
+                                grid.current_underline_color = Some((
+                                    values[i + 2] as u8,
+                                    values[i + 3] as u8,
+                                    values[i + 4] as u8,
+                                ));
+                                i += 4;
+                            } else if i + 2 < values.len() && values[i + 1] == 5 {
+                                grid.current_underline_color = Some(palette_ansi_256(palette, values[i + 2] as u8));
+                                i += 2;
+                            }
+                        }
+                        59 => grid.current_underline_color = None,
                         90..=97 => grid.current_fg = palette_ansi_16_fg(palette, val as u8 - 90 + 8),
                         100..=107 => grid.current_bg = palette_ansi_16_bg(palette, val as u8 - 100 + 8),
                         _ => {}

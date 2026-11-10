@@ -264,6 +264,9 @@ pub struct TerminalRenderer {
     bg_uniform_buffer: wgpu::Buffer,
     bg_vertex_buffer: wgpu::Buffer,
     bg_vertex_capacity: usize,
+    overlay_vertex_buffer: wgpu::Buffer,
+    overlay_vertex_capacity: usize,
+    overlay_text_renderer: TextRenderer,
 
     // Sixel Görsel Render Hattı (Y2: Doku ve Bind Group Önbelleği)
     image_pipeline: wgpu::RenderPipeline,
@@ -346,6 +349,7 @@ impl TerminalRenderer {
     pub async fn new(
         window: Arc<Window>,
         custom_font: Option<String>,
+        fallback_fonts: Vec<String>,
         initial_font_size: Option<f32>,
     ) -> anyhow::Result<Self> {
         let size = window.inner_size();
@@ -418,51 +422,28 @@ impl TerminalRenderer {
 
         let font_family = {
             let db = font_system.db();
+            let mut candidates: Vec<String> = Vec::new();
             if let Some(cf) = custom_font {
-                if db.faces().any(|f| f.families.iter().any(|(fam, _)| fam == &cf)) {
-                    cf
-                } else {
-                    let preferred = [
-                        "MesloLGS Nerd Font Mono",
-                        "MesloLGS Nerd Font",
-                        "MesloLGM Nerd Font Mono",
-                        "MesloLGM Nerd Font",
-                        "FantasqueSansM Nerd Font Mono",
-                        "Noto Sans Mono",
-                        "DejaVu Sans Mono",
-                        "Liberation Mono",
-                    ];
-                    preferred
-                        .iter()
-                        .find(|&&name| {
-                            db.faces()
-                                .any(|f| f.families.iter().any(|(fam, _)| fam == name))
-                        })
-                        .copied()
-                        .unwrap_or("monospace")
-                        .to_string()
-                }
-            } else {
-                let preferred = [
-                    "MesloLGS Nerd Font Mono",
-                    "MesloLGS Nerd Font",
-                    "MesloLGM Nerd Font Mono",
-                    "MesloLGM Nerd Font",
-                    "FantasqueSansM Nerd Font Mono",
-                    "Noto Sans Mono",
-                    "DejaVu Sans Mono",
-                    "Liberation Mono",
-                ];
-                preferred
-                    .iter()
-                    .find(|&&name| {
-                        db.faces()
-                            .any(|f| f.families.iter().any(|(fam, _)| fam == name))
-                    })
-                    .copied()
-                    .unwrap_or("monospace")
-                    .to_string()
+                candidates.push(cf);
             }
+            candidates.extend(fallback_fonts);
+            candidates.extend([
+                "MesloLGS Nerd Font Mono".to_string(),
+                "MesloLGS Nerd Font".to_string(),
+                "MesloLGM Nerd Font Mono".to_string(),
+                "MesloLGM Nerd Font".to_string(),
+                "FantasqueSansM Nerd Font Mono".to_string(),
+                "Noto Sans Mono".to_string(),
+                "DejaVu Sans Mono".to_string(),
+                "Liberation Mono".to_string(),
+            ]);
+
+            candidates
+                .into_iter()
+                .find(|name| {
+                    db.faces().any(|f| f.families.iter().any(|(fam, _)| fam == name))
+                })
+                .unwrap_or_else(|| "monospace".to_string())
         };
 
         font_system.db_mut().set_monospace_family(&font_family);
@@ -474,6 +455,12 @@ impl TerminalRenderer {
 
         let mut text_atlas = TextAtlas::new(&device, &queue, &cache, surface_format);
         let text_renderer = TextRenderer::new(
+            &mut text_atlas,
+            &device,
+            wgpu::MultisampleState::default(),
+            None,
+        );
+        let overlay_text_renderer = TextRenderer::new(
             &mut text_atlas,
             &device,
             wgpu::MultisampleState::default(),
@@ -517,7 +504,7 @@ impl TerminalRenderer {
         );
         let context_menu_buffer = glyphon::Buffer::new(
             &mut font_system,
-            Metrics::new(font_size * 0.88, cell_height * 0.95),
+            Metrics::new(font_size * 0.88, cell_height + 4.0),
         );
 
         // 2. Arka Plan Dikdörtgen (Quad) Shader ve Pipeline Kurulumu
@@ -605,6 +592,12 @@ impl TerminalRenderer {
         let initial_capacity = 4096;
         let bg_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Background Vertex Buffer"),
+            size: (initial_capacity * std::mem::size_of::<BackgroundVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let overlay_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Overlay Vertex Buffer"),
             size: (initial_capacity * std::mem::size_of::<BackgroundVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -739,6 +732,9 @@ impl TerminalRenderer {
             bg_uniform_buffer,
             bg_vertex_buffer,
             bg_vertex_capacity: initial_capacity,
+            overlay_vertex_buffer,
+            overlay_vertex_capacity: initial_capacity,
+            overlay_text_renderer,
             image_pipeline,
             image_bind_group_layout,
             image_sampler,
@@ -815,9 +811,15 @@ impl TerminalRenderer {
             glyphon::Buffer::new(&mut self.font_system, glyphon::Metrics::new(font_size * 0.9, self.cell_height));
         self.palette_footer_buffer =
             glyphon::Buffer::new(&mut self.font_system, glyphon::Metrics::new((font_size * 0.8).round().max(9.0), 22.0));
+        self.context_menu_buffer =
+            glyphon::Buffer::new(&mut self.font_system, glyphon::Metrics::new(font_size * 0.88, self.cell_height + 4.0));
         self.tab_buffers.clear();
         self.pane_buffers.clear();
         self.pane_cached_states.clear();
+    }
+
+    pub fn context_menu_item_height(&self) -> f32 {
+        (self.cell_height + 10.0).max(28.0)
     }
 
     pub fn calculate_grid_size(&self, width: u32, height: u32, has_header: bool) -> (usize, usize) {
@@ -890,6 +892,7 @@ impl TerminalRenderer {
 
         // 1. Arka Plan Dikdörtgenlerini (Quad) Oluştur
         let mut bg_vertices: Vec<BackgroundVertex> = Vec::new();
+        let mut overlay_vertices: Vec<BackgroundVertex> = Vec::new();
 
         while self.pane_buffers.len() < panes.len() {
             self.pane_buffers.push(glyphon::Buffer::new(
@@ -1014,7 +1017,8 @@ impl TerminalRenderer {
 
                     let cell_y = pane_py + r as f32 * self.cell_height;
                     let mut active_bg_span: Option<(usize, usize, [f32; 4])> = None;
-                    let mut active_ul_span: Option<(usize, usize, [f32; 4])> = None;
+                    let mut active_ul_span: Option<(usize, usize, [f32; 4], term_core::cell::UnderlineStyle)> = None;
+                    let mut active_strike_span: Option<(usize, usize, [f32; 4])> = None;
 
                     for (c, cell) in line_cells.iter().enumerate() {
                         let is_selected = grid
@@ -1080,33 +1084,88 @@ impl TerminalRenderer {
                         // Altı çizili metin desteği ve yatay kümeleme (SGR 4 veya OSC 8 Köprü)
                         let is_hyperlink = cell.get_hyperlink_id().is_some();
                         let cell_ul = if (cell.underline || is_hyperlink) && !(is_cursor && grid.cursor_shape == CursorShape::Underline) {
-                            if is_hyperlink {
-                                // OSC 8 linkleri için hoş mavi tonlu alt çizgi
-                                Some([122.0 / 255.0, 162.0 / 255.0, 247.0 / 255.0, 0.85])
+                            let style = if is_hyperlink && cell.underline_style == term_core::cell::UnderlineStyle::None {
+                                term_core::cell::UnderlineStyle::Single
                             } else {
-                                Some([
+                                cell.underline_style
+                            };
+                            let col = if is_hyperlink {
+                                [122.0 / 255.0, 162.0 / 255.0, 247.0 / 255.0, 0.85]
+                            } else if let Some((ur, ug, ub)) = cell.underline_color_rgb() {
+                                [ur as f32 / 255.0, ug as f32 / 255.0, ub as f32 / 255.0, 0.95]
+                            } else {
+                                [
                                     eff_fg.0 as f32 / 255.0,
                                     eff_fg.1 as f32 / 255.0,
                                     eff_fg.2 as f32 / 255.0,
                                     0.9,
-                                ])
-                            }
+                                ]
+                            };
+                            Some((col, style))
                         } else {
                             None
                         };
 
                         match (active_ul_span, cell_ul) {
+                            (Some((start, _, color, style)), Some((new_color, new_style))) if color == new_color && style == new_style => {
+                                active_ul_span = Some((start, c + 1, color, style));
+                            }
+                            (Some((start, end, color, style)), new_opt) => {
+                                let span_x = pane_px + start as f32 * self.cell_width;
+                                let span_w = (end - start) as f32 * self.cell_width;
+                                match style {
+                                    term_core::cell::UnderlineStyle::Double => {
+                                        push_quad(&mut pane_bg_vertices, span_x, cell_y + self.cell_height - 3.0, span_w, 1.0, color);
+                                        push_quad(&mut pane_bg_vertices, span_x, cell_y + self.cell_height - 1.0, span_w, 1.0, color);
+                                    }
+                                    term_core::cell::UnderlineStyle::Curly => {
+                                        let seg_w = 4.0f32;
+                                        let mut cur_x = span_x;
+                                        let mut high = false;
+                                        while cur_x < span_x + span_w {
+                                            let seg_len = seg_w.min(span_x + span_w - cur_x);
+                                            let y_off = if high { 2.5 } else { 1.0 };
+                                            push_quad(&mut pane_bg_vertices, cur_x, cell_y + self.cell_height - y_off, seg_len, 1.2, color);
+                                            cur_x += seg_len;
+                                            high = !high;
+                                        }
+                                    }
+                                    _ => {
+                                        push_quad(&mut pane_bg_vertices, span_x, cell_y + self.cell_height - 1.5, span_w, 1.5, color);
+                                    }
+                                }
+                                active_ul_span = new_opt.map(|(col, st)| (c, c + 1, col, st));
+                            }
+                            (None, Some((new_color, new_style))) => {
+                                active_ul_span = Some((c, c + 1, new_color, new_style));
+                            }
+                            (None, None) => {}
+                        }
+
+                        // Üstü çizili metin desteği (Strikethrough - SGR 9)
+                        let cell_strike = if cell.strikethrough {
+                            Some([
+                                eff_fg.0 as f32 / 255.0,
+                                eff_fg.1 as f32 / 255.0,
+                                eff_fg.2 as f32 / 255.0,
+                                0.85,
+                            ])
+                        } else {
+                            None
+                        };
+
+                        match (active_strike_span, cell_strike) {
                             (Some((start, _, color)), Some(new_color)) if color == new_color => {
-                                active_ul_span = Some((start, c + 1, color));
+                                active_strike_span = Some((start, c + 1, color));
                             }
                             (Some((start, end, color)), new_opt) => {
                                 let span_x = pane_px + start as f32 * self.cell_width;
                                 let span_w = (end - start) as f32 * self.cell_width;
-                                push_quad(&mut pane_bg_vertices, span_x, cell_y + self.cell_height - 1.5, span_w, 1.5, color);
-                                active_ul_span = new_opt.map(|col| (c, c + 1, col));
+                                push_quad(&mut pane_bg_vertices, span_x, cell_y + self.cell_height * 0.55, span_w, 1.5, color);
+                                active_strike_span = new_opt.map(|col| (c, c + 1, col));
                             }
                             (None, Some(new_color)) => {
-                                active_ul_span = Some((c, c + 1, new_color));
+                                active_strike_span = Some((c, c + 1, new_color));
                             }
                             (None, None) => {}
                         }
@@ -1155,10 +1214,35 @@ impl TerminalRenderer {
                         let span_w = (end - start) as f32 * self.cell_width;
                         push_quad(&mut pane_bg_vertices, span_x, cell_y, span_w, self.cell_height, color);
                     }
-                    if let Some((start, end, color)) = active_ul_span {
+                    if let Some((start, end, color, style)) = active_ul_span {
                         let span_x = pane_px + start as f32 * self.cell_width;
                         let span_w = (end - start) as f32 * self.cell_width;
-                        push_quad(&mut pane_bg_vertices, span_x, cell_y + self.cell_height - 1.5, span_w, 1.5, color);
+                        match style {
+                            term_core::cell::UnderlineStyle::Double => {
+                                push_quad(&mut pane_bg_vertices, span_x, cell_y + self.cell_height - 3.0, span_w, 1.0, color);
+                                push_quad(&mut pane_bg_vertices, span_x, cell_y + self.cell_height - 1.0, span_w, 1.0, color);
+                            }
+                            term_core::cell::UnderlineStyle::Curly => {
+                                let seg_w = 4.0f32;
+                                let mut cur_x = span_x;
+                                let mut high = false;
+                                while cur_x < span_x + span_w {
+                                    let seg_len = seg_w.min(span_x + span_w - cur_x);
+                                    let y_off = if high { 2.5 } else { 1.0 };
+                                    push_quad(&mut pane_bg_vertices, cur_x, cell_y + self.cell_height - y_off, seg_len, 1.2, color);
+                                    cur_x += seg_len;
+                                    high = !high;
+                                }
+                            }
+                            _ => {
+                                push_quad(&mut pane_bg_vertices, span_x, cell_y + self.cell_height - 1.5, span_w, 1.5, color);
+                            }
+                        }
+                    }
+                    if let Some((start, end, color)) = active_strike_span {
+                        let span_x = pane_px + start as f32 * self.cell_width;
+                        let span_w = (end - start) as f32 * self.cell_width;
+                        push_quad(&mut pane_bg_vertices, span_x, cell_y + self.cell_height * 0.55, span_w, 1.5, color);
                     }
 
                     if !current_span_text.is_empty() {
@@ -1302,18 +1386,18 @@ impl TerminalRenderer {
                     let bar_y = pane_py + 8.0;
 
                     push_quad(
-                        &mut bg_vertices,
+                        &mut overlay_vertices,
                         bar_x,
                         bar_y,
                         bar_width,
                         bar_height,
-                        [18.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 0.98],
+                        [18.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0],
                     );
                     let s_border = self.theme_cursor_color;
-                    push_quad(&mut bg_vertices, bar_x, bar_y, bar_width, 1.5, s_border);
-                    push_quad(&mut bg_vertices, bar_x, bar_y + bar_height - 1.5, bar_width, 1.5, s_border);
-                    push_quad(&mut bg_vertices, bar_x, bar_y, 1.5, bar_height, s_border);
-                    push_quad(&mut bg_vertices, bar_x + bar_width - 1.5, bar_y, 1.5, bar_height, s_border);
+                    push_quad(&mut overlay_vertices, bar_x, bar_y, bar_width, 1.5, s_border);
+                    push_quad(&mut overlay_vertices, bar_x, bar_y + bar_height - 1.5, bar_width, 1.5, s_border);
+                    push_quad(&mut overlay_vertices, bar_x, bar_y, 1.5, bar_height, s_border);
+                    push_quad(&mut overlay_vertices, bar_x + bar_width - 1.5, bar_y, 1.5, bar_height, s_border);
 
                     self.search_buffer.set_text(
                         &mut self.font_system,
@@ -1677,15 +1761,15 @@ impl TerminalRenderer {
                             tip_x = tip_x.clamp(8.0, (screen_w - tip_w - 8.0).max(8.0));
 
                             // Tooltip kart gölgesi / arka planı
-                            let tip_bg = [15.0 / 255.0, 16.0 / 255.0, 24.0 / 255.0, 0.98];
+                            let tip_bg = [15.0 / 255.0, 16.0 / 255.0, 24.0 / 255.0, 1.0];
                             let tip_border = [55.0 / 255.0, 65.0 / 255.0, 95.0 / 255.0, 0.95];
-                            push_quad(&mut bg_vertices, tip_x, tip_y, tip_w, tip_h, tip_bg);
-                            push_quad(&mut bg_vertices, tip_x, tip_y, tip_w, 1.0, tip_border);
-                            push_quad(&mut bg_vertices, tip_x, tip_y + tip_h - 1.0, tip_w, 1.0, tip_border);
-                            push_quad(&mut bg_vertices, tip_x, tip_y, 1.0, tip_h, tip_border);
-                            push_quad(&mut bg_vertices, tip_x + tip_w - 1.0, tip_y, 1.0, tip_h, tip_border);
+                            push_quad(&mut overlay_vertices, tip_x, tip_y, tip_w, tip_h, tip_bg);
+                            push_quad(&mut overlay_vertices, tip_x, tip_y, tip_w, 1.0, tip_border);
+                            push_quad(&mut overlay_vertices, tip_x, tip_y + tip_h - 1.0, tip_w, 1.0, tip_border);
+                            push_quad(&mut overlay_vertices, tip_x, tip_y, 1.0, tip_h, tip_border);
+                            push_quad(&mut overlay_vertices, tip_x + tip_w - 1.0, tip_y, 1.0, tip_h, tip_border);
                             // Kartın üstüne 2px tema vurgu çizgisi
-                            push_quad(&mut bg_vertices, tip_x, tip_y, tip_w, 2.0, self.theme_cursor_color);
+                            push_quad(&mut overlay_vertices, tip_x, tip_y, tip_w, 2.0, self.theme_cursor_color);
 
                             self.tooltip_buffer.set_text(
                                 &mut self.font_system,
@@ -1712,7 +1796,7 @@ impl TerminalRenderer {
             let screen_h = self.config.height as f32;
 
             // 1. Karartma arkaplanı (Dim Backdrop Veil)
-            push_quad(&mut bg_vertices, 0.0, 0.0, screen_w, screen_h, [0.0, 0.0, 0.0, 0.62]);
+            push_quad(&mut overlay_vertices, 0.0, 0.0, screen_w, screen_h, [0.0, 0.0, 0.0, 0.62]);
 
             let pw = 540.0_f32.min(screen_w - 24.0);
             let ph = 350.0_f32.min(screen_h - 60.0);
@@ -1720,25 +1804,25 @@ impl TerminalRenderer {
             let py = 50.0;
 
             // 2. Gölge / derinlik kenarlığı
-            push_quad(&mut bg_vertices, px - 2.0, py - 2.0, pw + 4.0, ph + 4.0, [8.0 / 255.0, 10.0 / 255.0, 16.0 / 255.0, 0.85]);
+            push_quad(&mut overlay_vertices, px - 2.0, py - 2.0, pw + 4.0, ph + 4.0, [8.0 / 255.0, 10.0 / 255.0, 16.0 / 255.0, 0.85]);
 
             // 3. Palet kart gövdesi
-            push_quad(&mut bg_vertices, px, py, pw, ph, [16.0 / 255.0, 18.0 / 255.0, 26.0 / 255.0, 0.98]);
+            push_quad(&mut overlay_vertices, px, py, pw, ph, [16.0 / 255.0, 18.0 / 255.0, 26.0 / 255.0, 1.0]);
 
             // 4. Kenarlıklar
             let card_border = [50.0 / 255.0, 58.0 / 255.0, 82.0 / 255.0, 0.95];
-            push_quad(&mut bg_vertices, px, py, pw, 1.0, card_border);
-            push_quad(&mut bg_vertices, px, py + ph - 1.0, pw, 1.0, card_border);
-            push_quad(&mut bg_vertices, px, py, 1.0, ph, card_border);
-            push_quad(&mut bg_vertices, px + pw - 1.0, py, 1.0, ph, card_border);
+            push_quad(&mut overlay_vertices, px, py, pw, 1.0, card_border);
+            push_quad(&mut overlay_vertices, px, py + ph - 1.0, pw, 1.0, card_border);
+            push_quad(&mut overlay_vertices, px, py, 1.0, ph, card_border);
+            push_quad(&mut overlay_vertices, px + pw - 1.0, py, 1.0, ph, card_border);
 
             // 5. Üst 2.5px parlak tema vurgu çizgisi
-            push_quad(&mut bg_vertices, px, py, pw, 2.5, self.theme_cursor_color);
+            push_quad(&mut overlay_vertices, px, py, pw, 2.5, self.theme_cursor_color);
 
             // 6. Arama girdi alanı
             let search_h = 38.0;
-            push_quad(&mut bg_vertices, px + 1.0, py + 2.5, pw - 2.0, search_h, [12.0 / 255.0, 13.0 / 255.0, 19.0 / 255.0, 1.0]);
-            push_quad(&mut bg_vertices, px, py + search_h + 2.5, pw, 1.0, card_border);
+            push_quad(&mut overlay_vertices, px + 1.0, py + 2.5, pw - 2.0, search_h, [12.0 / 255.0, 13.0 / 255.0, 19.0 / 255.0, 1.0]);
+            push_quad(&mut overlay_vertices, px, py + search_h + 2.5, pw, 1.0, card_border);
 
             // Arama kutusundaki imleç
             let query_w = (pal.query.chars().count() as f32 + 2.0) * self.cell_width * 0.9;
@@ -1746,11 +1830,11 @@ impl TerminalRenderer {
             let cursor_y = py + 12.0;
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
             if (now_ms / 500).is_multiple_of(2) {
-                push_quad(&mut bg_vertices, cursor_x, cursor_y, 2.0, 18.0, self.theme_cursor_color);
+                push_quad(&mut overlay_vertices, cursor_x, cursor_y, 2.0, 18.0, self.theme_cursor_color);
             }
 
             // 7. Liste Öğeleri
-            let item_h = 32.0;
+            let item_h = (self.cell_height + 10.0).max(32.0);
             let max_visible = 7;
             let items = pal.items;
             let total = items.len();
@@ -1765,15 +1849,15 @@ impl TerminalRenderer {
             for (visible_i, idx) in (start_idx..end_idx).enumerate() {
                 let iy = py + search_h + 8.0 + visible_i as f32 * item_h;
                 if idx == selected {
-                    push_quad(&mut bg_vertices, px + 6.0, iy, pw - 12.0, item_h - 2.0, [34.0 / 255.0, 42.0 / 255.0, 68.0 / 255.0, 0.9]);
-                    push_quad(&mut bg_vertices, px + 6.0, iy, 3.0, item_h - 2.0, self.theme_cursor_color);
+                    push_quad(&mut overlay_vertices, px + 6.0, iy, pw - 12.0, item_h - 2.0, [34.0 / 255.0, 42.0 / 255.0, 68.0 / 255.0, 0.9]);
+                    push_quad(&mut overlay_vertices, px + 6.0, iy, 3.0, item_h - 2.0, self.theme_cursor_color);
                 }
             }
 
             // 8. Alt Bilgi Çubuğu (Footer)
             let footer_y = py + ph - 28.0;
-            push_quad(&mut bg_vertices, px, footer_y, pw, 1.0, card_border);
-            push_quad(&mut bg_vertices, px + 1.0, footer_y + 1.0, pw - 2.0, 27.0, [12.0 / 255.0, 13.0 / 255.0, 19.0 / 255.0, 1.0]);
+            push_quad(&mut overlay_vertices, px, footer_y, pw, 1.0, card_border);
+            push_quad(&mut overlay_vertices, px + 1.0, footer_y + 1.0, pw - 2.0, 27.0, [12.0 / 255.0, 13.0 / 255.0, 19.0 / 255.0, 1.0]);
 
             // 9. Metinlerin formatlanması (Spans for palette_buffer)
             let mut pal_spans: Vec<(String, glyphon::Attrs)> = Vec::new();
@@ -1839,7 +1923,7 @@ impl TerminalRenderer {
             let screen_w = self.config.width as f32;
             let screen_h = self.config.height as f32;
 
-            let item_h = 28.0;
+            let item_h = (self.cell_height + 10.0).max(28.0);
             let mw = 220.0;
             let mh = (menu.items.len() as f32 * item_h) + 8.0;
 
@@ -1849,7 +1933,7 @@ impl TerminalRenderer {
 
             // Dış derinlik gölgesi
             push_quad(
-                &mut bg_vertices,
+                &mut overlay_vertices,
                 mx - 2.0,
                 my - 2.0,
                 mw + 4.0,
@@ -1859,30 +1943,30 @@ impl TerminalRenderer {
 
             // Menü gövde kartı
             push_quad(
-                &mut bg_vertices,
+                &mut overlay_vertices,
                 mx,
                 my,
                 mw,
                 mh,
-                [20.0 / 255.0, 22.0 / 255.0, 32.0 / 255.0, 0.98],
+                [20.0 / 255.0, 22.0 / 255.0, 32.0 / 255.0, 1.0],
             );
 
             // Menü kenarlığı
             let border_c = [56.0 / 255.0, 64.0 / 255.0, 90.0 / 255.0, 0.9];
-            push_quad(&mut bg_vertices, mx, my, mw, 1.0, border_c);
-            push_quad(&mut bg_vertices, mx, my + mh - 1.0, mw, 1.0, border_c);
-            push_quad(&mut bg_vertices, mx, my, 1.0, mh, border_c);
-            push_quad(&mut bg_vertices, mx + mw - 1.0, my, 1.0, mh, border_c);
+            push_quad(&mut overlay_vertices, mx, my, mw, 1.0, border_c);
+            push_quad(&mut overlay_vertices, mx, my + mh - 1.0, mw, 1.0, border_c);
+            push_quad(&mut overlay_vertices, mx, my, 1.0, mh, border_c);
+            push_quad(&mut overlay_vertices, mx + mw - 1.0, my, 1.0, mh, border_c);
 
             // Sol tarafta şık dikey tema aksanı
-            push_quad(&mut bg_vertices, mx, my, 2.5, mh, self.theme_cursor_color);
+            push_quad(&mut overlay_vertices, mx, my, 2.5, mh, self.theme_cursor_color);
 
             // Menü öğeleri hover arka planı
             for (idx, _) in menu.items.iter().enumerate() {
                 let iy = my + 4.0 + idx as f32 * item_h;
                 if menu.selected_index == Some(idx) {
                     push_quad(
-                        &mut bg_vertices,
+                        &mut overlay_vertices,
                         mx + 3.0,
                         iy,
                         mw - 6.0,
@@ -1962,9 +2046,27 @@ impl TerminalRenderer {
             );
         }
 
-        let mut text_areas = Vec::new();
+        // Overlay vertex buffer'ına yaz
+        if !overlay_vertices.is_empty() {
+            if overlay_vertices.len() > self.overlay_vertex_capacity {
+                self.overlay_vertex_capacity = overlay_vertices.len() * 2;
+                self.overlay_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Overlay Vertex Buffer (Expanded)"),
+                    size: (self.overlay_vertex_capacity * std::mem::size_of::<BackgroundVertex>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            self.queue.write_buffer(
+                &self.overlay_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&overlay_vertices),
+            );
+        }
+
+        let mut base_text_areas = Vec::new();
         for (p_idx, px, py, pw, ph) in pane_text_areas {
-            text_areas.push(TextArea {
+            base_text_areas.push(TextArea {
                 buffer: &self.pane_buffers[p_idx],
                 left: px,
                 top: py,
@@ -1986,7 +2088,7 @@ impl TerminalRenderer {
                     get_top_bar_layout(self.config.width as f32, tab_list.len());
                 for (idx, tab) in tab_list.iter().enumerate() {
                     let tx = idx as f32 * tab_w;
-                    text_areas.push(TextArea {
+                    base_text_areas.push(TextArea {
                         buffer: &self.tab_buffers[idx],
                         left: tx + 20.0,
                         top: 6.0,
@@ -2008,8 +2110,10 @@ impl TerminalRenderer {
             }
         }
 
+        let mut overlay_text_areas = Vec::new();
+
         if let Some((bx, by, bw, bh)) = search_overlay {
-            text_areas.push(TextArea {
+            overlay_text_areas.push(TextArea {
                 buffer: &self.search_buffer,
                 left: bx + 8.0,
                 top: by + 4.0,
@@ -2026,7 +2130,7 @@ impl TerminalRenderer {
         }
 
         if let Some((tx, ty, tw, th)) = tooltip_overlay {
-            text_areas.push(TextArea {
+            overlay_text_areas.push(TextArea {
                 buffer: &self.tooltip_buffer,
                 left: tx + 10.0,
                 top: ty + 4.0,
@@ -2044,7 +2148,7 @@ impl TerminalRenderer {
 
         if let Some((px, py, pw, ph, total, selected)) = palette_overlay {
             // Ana palet listesi
-            text_areas.push(TextArea {
+            overlay_text_areas.push(TextArea {
                 buffer: &self.palette_buffer,
                 left: px + 14.0,
                 top: py + 10.0,
@@ -2071,7 +2175,7 @@ impl TerminalRenderer {
             );
             self.palette_footer_buffer.shape_until_scroll(&mut self.font_system, false);
 
-            text_areas.push(TextArea {
+            overlay_text_areas.push(TextArea {
                 buffer: &self.palette_footer_buffer,
                 left: px + 8.0,
                 top: py + ph - 23.0,
@@ -2088,7 +2192,7 @@ impl TerminalRenderer {
         }
 
         if let Some((mx, my, mw, mh)) = context_menu_overlay {
-            text_areas.push(TextArea {
+            overlay_text_areas.push(TextArea {
                 buffer: &self.context_menu_buffer,
                 left: mx + 4.0,
                 top: my + 6.0,
@@ -2111,10 +2215,22 @@ impl TerminalRenderer {
                 &mut self.font_system,
                 &mut self.text_atlas,
                 &self.viewport,
-                text_areas,
+                base_text_areas,
                 &mut self.swash_cache,
             )
-            .map_err(|e| anyhow::anyhow!("Glyphon prepare error: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("Glyphon prepare base error: {:?}", e))?;
+
+        self.overlay_text_renderer
+            .prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.text_atlas,
+                &self.viewport,
+                overlay_text_areas,
+                &mut self.swash_cache,
+            )
+            .map_err(|e| anyhow::anyhow!("Glyphon prepare overlay error: {:?}", e))?;
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2233,21 +2349,46 @@ impl TerminalRenderer {
             for pane in panes {
                 let pane_x = padding_left + pane.col_offset as f32 * self.cell_width;
                 let pane_y = padding_top + pane.row_offset as f32 * self.cell_height;
+                let pane_max_x = pane_x + pane.cols as f32 * self.cell_width;
+                let pane_max_y = pane_y + pane.rows as f32 * self.cell_height;
 
                 for img in &pane.grid.images {
                     if img.width == 0 || img.height == 0 || img.rgba.is_empty() {
                         continue;
                     }
                     if let Some((_, bind_group)) = self.image_cache.get(&img.id) {
+                        if let Some(pos) = self.image_cache_lru.iter().position(|&x| x == img.id) {
+                            self.image_cache_lru.remove(pos);
+                        }
+                        self.image_cache_lru.push(img.id);
+
                         let img_x = pane_x + img.col as f32 * self.cell_width;
                         let img_y = pane_y + img.row as f32 * self.cell_height;
-                        let img_w = img.width as f32;
-                        let img_h = img.height as f32;
+                        if img_x >= pane_max_x || img_y >= pane_max_y {
+                            continue;
+                        }
 
-                        let v0 = ImageVertex { position: [img_x, img_y], tex_coords: [0.0, 0.0] };
-                        let v1 = ImageVertex { position: [img_x + img_w, img_y], tex_coords: [1.0, 0.0] };
-                        let v2 = ImageVertex { position: [img_x, img_y + img_h], tex_coords: [0.0, 1.0] };
-                        let v3 = ImageVertex { position: [img_x + img_w, img_y + img_h], tex_coords: [1.0, 1.0] };
+                        let (v_top, base_h) = if img.top_offset_rows > 0 {
+                            let eff_cell_h = self.cell_height.max(1.0);
+                            let scrolled_px = (img.top_offset_rows as f32 * eff_cell_h).min(img.height as f32);
+                            (scrolled_px / img.height as f32, img.height as f32 - scrolled_px)
+                        } else {
+                            (0.0, img.height as f32)
+                        };
+
+                        let draw_w = (img.width as f32).min(pane_max_x - img_x);
+                        let draw_h = base_h.min(pane_max_y - img_y);
+                        if draw_w <= 0.0 || draw_h <= 0.0 {
+                            continue;
+                        }
+
+                        let u_right = (draw_w / img.width as f32).min(1.0);
+                        let v_bottom = (v_top + (draw_h / img.height as f32)).min(1.0);
+
+                        let v0 = ImageVertex { position: [img_x, img_y], tex_coords: [0.0, v_top] };
+                        let v1 = ImageVertex { position: [img_x + draw_w, img_y], tex_coords: [u_right, v_top] };
+                        let v2 = ImageVertex { position: [img_x, img_y + draw_h], tex_coords: [0.0, v_bottom] };
+                        let v3 = ImageVertex { position: [img_x + draw_w, img_y + draw_h], tex_coords: [u_right, v_bottom] };
 
                         let start_vertex = all_image_vertices.len() as u32;
                         all_image_vertices.extend_from_slice(&[v0, v2, v1, v1, v2, v3]);
@@ -2285,6 +2426,18 @@ impl TerminalRenderer {
 
             // Adım 2: Metin Gliflerini Arka Planın Üzerine Çiz
             self.text_renderer
+                .render(&self.text_atlas, &self.viewport, &mut pass)?;
+
+            // Adım 3: Overlay (Arama Çubuğu, Komut Paleti, Bağlam Menüsü) Arka Plan Çerçevelerini Çiz
+            if !overlay_vertices.is_empty() {
+                pass.set_pipeline(&self.bg_pipeline);
+                pass.set_bind_group(0, &self.bg_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.overlay_vertex_buffer.slice(..));
+                pass.draw(0..overlay_vertices.len() as u32, 0..1);
+            }
+
+            // Adım 4: Overlay Metin Gliflerini Çiz
+            self.overlay_text_renderer
                 .render(&self.text_atlas, &self.viewport, &mut pass)?;
         }
 

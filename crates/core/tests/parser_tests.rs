@@ -797,3 +797,114 @@ fn test_turkish_istanbul_search_no_panic() {
     // "İstanbul" ve "bugün" içinde 'i' veya 'İ' eşleşmesi
     assert!(!parser.grid().search_matches.is_empty());
 }
+
+#[test]
+fn test_sixel_scroll_up_and_cleanup() {
+    let mut parser = CoreParser::new(80, 24);
+    parser.set_cell_height(16);
+    // 3 band * 6 = 18px -> rows_spanned = 18.div_ceil(16) = 2 satır
+    // Cursor'u satır 2'ye taşı
+    parser.process_bytes(b"\x1b[3;1H");
+    assert_eq!(parser.grid().cursor_row, 2);
+
+    let sixel_data = b"\x1bPq\"1;1;10;18#0;2;0;0;0#0!10~-!10~-!10~-\x1b\\";
+    parser.process_bytes(sixel_data);
+
+    assert_eq!(parser.grid().images.len(), 1);
+    assert_eq!(parser.grid().images[0].row, 2);
+    assert_eq!(parser.grid().images[0].rows_spanned, 2);
+    assert_eq!(parser.grid().images[0].top_offset_rows, 0);
+
+    // 1 satır yukarı kaydır: row 2 -> 1, rows_spanned = 2
+    parser.grid_mut().scroll_up_in_region(1);
+    assert_eq!(parser.grid().images.len(), 1);
+    assert_eq!(parser.grid().images[0].row, 1);
+    assert_eq!(parser.grid().images[0].rows_spanned, 2);
+    assert_eq!(parser.grid().images[0].top_offset_rows, 0);
+
+    // 1 satır daha yukarı kaydır: row 1 -> 0, rows_spanned = 2
+    parser.grid_mut().scroll_up_in_region(1);
+    assert_eq!(parser.grid().images.len(), 1);
+    assert_eq!(parser.grid().images[0].row, 0);
+    assert_eq!(parser.grid().images[0].rows_spanned, 2);
+    assert_eq!(parser.grid().images[0].top_offset_rows, 0);
+
+    // 1 satır daha yukarı kaydır: görselin üst satırı ekran dışına çıkar, row = 0 kalır, rows_spanned 2 -> 1, top_offset_rows = 1
+    parser.grid_mut().scroll_up_in_region(1);
+    assert_eq!(parser.grid().images.len(), 1);
+    assert_eq!(parser.grid().images[0].row, 0);
+    assert_eq!(parser.grid().images[0].rows_spanned, 1);
+    assert_eq!(parser.grid().images[0].top_offset_rows, 1);
+
+    // 1 satır daha yukarı kaydır: görsel tamamen ekran dışına çıkar ve bellekten silinir
+    parser.grid_mut().scroll_up_in_region(1);
+    assert_eq!(parser.grid().images.len(), 0, "Görsel ekran dışına çıkınca tamamen silinmeli");
+}
+
+#[test]
+fn test_kitty_keyboard_protocol_modes_and_stack() {
+    let mut parser = CoreParser::new(80, 24);
+
+    // Mode 1: Doğrudan Değer Atama (Replace): CSI = 5 ; 1 u -> flags = 5
+    parser.process_bytes(b"\x1b[=5;1u");
+    assert_eq!(parser.keyboard_flags, 5);
+
+    // Mode 2: Bayrak Ekleme (Bitwise OR / Union): CSI = 2 ; 2 u -> 5 | 2 = 7
+    parser.process_bytes(b"\x1b[=2;2u");
+    assert_eq!(parser.keyboard_flags, 7);
+
+    // Mode 3: Bayrak Temizleme (Bitwise AND NOT): CSI = 1 ; 3 u -> 7 & !1 = 6
+    parser.process_bytes(b"\x1b[=1;3u");
+    assert_eq!(parser.keyboard_flags, 6);
+
+    // Sorgu: CSI ? u -> Yanıt: CSI ? 6 u
+    parser.process_bytes(b"\x1b[?u");
+    let resp = parser.drain_responses();
+    assert_eq!(resp, vec![b"\x1b[?6u".to_vec()]);
+
+    // Push with mode: CSI > 1 ; 2 u -> push 6, 6 | 1 = 7
+    parser.process_bytes(b"\x1b[>1;2u");
+    assert_eq!(parser.keyboard_flags, 7);
+    assert_eq!(parser.keyboard_flags_stack.len(), 1);
+
+    // Pop: CSI < 1 u -> restore 6
+    parser.process_bytes(b"\x1b[<1u");
+    assert_eq!(parser.keyboard_flags, 6);
+
+    // Stack sınırlaması: 40 kez push et
+    for i in 1..=40 {
+        parser.process_bytes(format!("\x1b[>{}u", i).as_bytes());
+    }
+    assert_eq!(parser.keyboard_flags, 40);
+    assert!(
+        parser.keyboard_flags_stack.len() <= 32,
+        "Stack boyutu 32 ile sınırlandırılmalı"
+    );
+}
+
+#[test]
+fn test_kitty_keyboard_protocol_alternate_screen_isolation() {
+    let mut parser = CoreParser::new(80, 24);
+
+    // Ana ekranda flags = 1 yap
+    parser.process_bytes(b"\x1b[=1;1u");
+    assert_eq!(parser.keyboard_flags, 1);
+    assert_eq!(parser.primary_keyboard_flags, 1);
+
+    // Alternatif ekrana geç (\x1b[?1049h): alt screen flags sıfır olmalı
+    parser.process_bytes(b"\x1b[?1049h");
+    assert!(parser.use_alt);
+    assert_eq!(parser.keyboard_flags, 0);
+
+    // Alternatif ekranda push ve flags = 3 ayarla
+    parser.process_bytes(b"\x1b[>3u");
+    assert_eq!(parser.keyboard_flags, 3);
+    assert_eq!(parser.alt_keyboard_flags, 3);
+
+    // Ana ekrana geri dön (\x1b[?1049l): ana ekran bayrağı 1 olarak korunmalı
+    parser.process_bytes(b"\x1b[?1049l");
+    assert!(!parser.use_alt);
+    assert_eq!(parser.keyboard_flags, 1);
+    assert_eq!(parser.primary_keyboard_flags, 1);
+}
+

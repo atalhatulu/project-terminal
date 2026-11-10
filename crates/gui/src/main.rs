@@ -160,6 +160,316 @@ fn app_window_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(APP_ICON_RGBA.to_vec(), 64, 64).ok()
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn encode_key_event(
+    logical_key: &Key,
+    text: Option<&str>,
+    is_shift: bool,
+    is_ctrl: bool,
+    is_alt: bool,
+    keyboard_flags: u32,
+    app_cursor: bool,
+    event_type: u8, // 1: press, 2: repeat, 3: release
+) -> Option<Vec<u8>> {
+    let mut mod_mask = 0u32;
+    if is_shift {
+        mod_mask |= 1;
+    }
+    if is_alt {
+        mod_mask |= 2;
+    }
+    if is_ctrl {
+        mod_mask |= 4;
+    }
+    let modifier_param = mod_mask + 1;
+
+    // Kitty Keyboard Protocol (CSI u Modu / Progressive Enhancement)
+    if keyboard_flags > 0 {
+        let report_event_type = (keyboard_flags & 2) != 0 && event_type != 1;
+        let suffix = if report_event_type {
+            format!(";{}:{}u", modifier_param, event_type)
+        } else if mod_mask > 0 {
+            format!(";{}u", modifier_param)
+        } else {
+            "u".to_string()
+        };
+
+        match logical_key {
+            Key::Named(NamedKey::Enter) => {
+                if mod_mask > 0 || report_event_type {
+                    return Some(format!("\x1b[13{}", suffix).into_bytes());
+                } else if keyboard_flags & 8 != 0 {
+                    return Some(b"\x1b[13u".to_vec());
+                }
+            }
+            Key::Named(NamedKey::Tab) => {
+                if mod_mask > 0 || report_event_type {
+                    return Some(format!("\x1b[9{}", suffix).into_bytes());
+                } else if keyboard_flags & 8 != 0 {
+                    return Some(b"\x1b[9u".to_vec());
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if mod_mask > 0 || report_event_type {
+                    return Some(format!("\x1b[127{}", suffix).into_bytes());
+                } else if keyboard_flags & 8 != 0 {
+                    return Some(b"\x1b[127u".to_vec());
+                }
+            }
+            Key::Named(NamedKey::Escape) => {
+                if mod_mask > 0 || report_event_type {
+                    return Some(format!("\x1b[27{}", suffix).into_bytes());
+                } else {
+                    return Some(b"\x1b[27u".to_vec());
+                }
+            }
+            Key::Named(NamedKey::Space) => {
+                if mod_mask > 0 || report_event_type {
+                    return Some(format!("\x1b[32{}", suffix).into_bytes());
+                } else if keyboard_flags & 8 != 0 {
+                    return Some(b"\x1b[32u".to_vec());
+                }
+            }
+            Key::Character(c) if is_ctrl || is_alt || (keyboard_flags & 8 != 0) || report_event_type => {
+                if let Some(ch) = c.chars().next() {
+                    let cp = ch.to_ascii_lowercase() as u32;
+                    if mod_mask > 0 || report_event_type {
+                        return Some(format!("\x1b[{}{}", cp, suffix).into_bytes());
+                    } else {
+                        return Some(format!("\x1b[{}u", cp).into_bytes());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if event_type == 3 {
+        // Release event for non-kitty or when flag 2 is not reporting this key
+        return None;
+    }
+
+    // Özel Tuşlar (Oklar, Fonksiyon Tuşları, Home/End, Backspace, Enter, Boşluk vb.)
+    match logical_key {
+        Key::Named(NamedKey::Space) => {
+            if is_ctrl {
+                Some(vec![0])
+            } else {
+                Some(vec![b' '])
+            }
+        }
+        Key::Named(NamedKey::Enter) => Some(vec![b'\r']),
+        Key::Named(NamedKey::Backspace) => Some(vec![0x7f]),
+        Key::Named(NamedKey::Tab) => {
+            if is_shift {
+                Some(b"\x1b[Z".to_vec())
+            } else {
+                Some(vec![b'\t'])
+            }
+        }
+        Key::Named(NamedKey::Escape) => Some(vec![0x1b]),
+
+        Key::Named(NamedKey::Delete) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[3;{}~", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1b[3~".to_vec())
+            }
+        }
+        Key::Named(NamedKey::Insert) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[2;{}~", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1b[2~".to_vec())
+            }
+        }
+        Key::Named(NamedKey::Home) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[1;{}H", modifier_param).into_bytes())
+            } else if app_cursor {
+                Some(b"\x1bOH".to_vec())
+            } else {
+                Some(b"\x1b[H".to_vec())
+            }
+        }
+        Key::Named(NamedKey::End) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[1;{}F", modifier_param).into_bytes())
+            } else if app_cursor {
+                Some(b"\x1bOF".to_vec())
+            } else {
+                Some(b"\x1b[F".to_vec())
+            }
+        }
+        Key::Named(NamedKey::PageUp) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[5;{}~", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1b[5~".to_vec())
+            }
+        }
+        Key::Named(NamedKey::PageDown) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[6;{}~", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1b[6~".to_vec())
+            }
+        }
+
+        Key::Named(NamedKey::ArrowUp) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[1;{}A", modifier_param).into_bytes())
+            } else if app_cursor {
+                Some(b"\x1bOA".to_vec())
+            } else {
+                Some(b"\x1b[A".to_vec())
+            }
+        }
+        Key::Named(NamedKey::ArrowDown) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[1;{}B", modifier_param).into_bytes())
+            } else if app_cursor {
+                Some(b"\x1bOB".to_vec())
+            } else {
+                Some(b"\x1b[B".to_vec())
+            }
+        }
+        Key::Named(NamedKey::ArrowRight) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[1;{}C", modifier_param).into_bytes())
+            } else if app_cursor {
+                Some(b"\x1bOC".to_vec())
+            } else {
+                Some(b"\x1b[C".to_vec())
+            }
+        }
+        Key::Named(NamedKey::ArrowLeft) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[1;{}D", modifier_param).into_bytes())
+            } else if app_cursor {
+                Some(b"\x1bOD".to_vec())
+            } else {
+                Some(b"\x1b[D".to_vec())
+            }
+        }
+
+        Key::Named(NamedKey::F1) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[1;{}P", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1bOP".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F2) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[1;{}Q", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1bOQ".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F3) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[13;{}~", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1bOR".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F4) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[1;{}S", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1bOS".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F5) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[15;{}~", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1b[15~".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F6) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[17;{}~", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1b[17~".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F7) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[18;{}~", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1b[18~".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F8) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[19;{}~", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1b[19~".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F9) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[20;{}~", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1b[20~".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F10) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[21;{}~", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1b[21~".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F11) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[23;{}~", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1b[23~".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F12) => {
+            if mod_mask > 0 {
+                Some(format!("\x1b[24;{}~", modifier_param).into_bytes())
+            } else {
+                Some(b"\x1b[24~".to_vec())
+            }
+        }
+
+        _ => {
+            if let Some(t) = text {
+                let mut b = t.as_bytes().to_vec();
+                if is_alt {
+                    let mut prefixed = vec![0x1b];
+                    prefixed.extend(b);
+                    b = prefixed;
+                }
+                Some(b)
+            } else if let Key::Character(s) = logical_key {
+                if is_ctrl && !is_alt {
+                    if let Some(ch) = s.chars().next() {
+                        let lower = ch.to_ascii_lowercase();
+                        if lower.is_ascii_lowercase() {
+                            return Some(vec![(lower as u8 - b'a' + 1)]);
+                        }
+                    }
+                }
+                let mut b = s.as_bytes().to_vec();
+                if is_alt {
+                    let mut prefixed = vec![0x1b];
+                    prefixed.extend(b);
+                    b = prefixed;
+                }
+                Some(b)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum AppEvent {
     PtyData { pane_id: usize, bytes: Vec<u8> },
@@ -634,10 +944,16 @@ opacity = 0.95
 
         let proxy = self.event_loop_proxy.clone();
         std::thread::spawn(move || {
+            const MAX_BATCH_SIZE: usize = 64 * 1024;
             while let Ok(first_chunk) = pty_rx.recv() {
                 let mut bytes = first_chunk;
-                while let Ok(more) = pty_rx.try_recv() {
-                    bytes.extend(more);
+                while bytes.len() < MAX_BATCH_SIZE {
+                    match pty_rx.try_recv() {
+                        Ok(more) => {
+                            bytes.extend(more);
+                        }
+                        Err(_) => break,
+                    }
                 }
                 if proxy.send_event(AppEvent::PtyData { pane_id, bytes }).is_err() {
                     break;
@@ -975,6 +1291,7 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
             let mut renderer = pollster::block_on(TerminalRenderer::new(
                 window.clone(),
                 self.config.font_family(),
+                self.config.fallback_families(),
                 Some(self.config.font_size()),
             ))
             .expect("Renderer başlatılamadı");
@@ -1241,6 +1558,17 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                     win.request_redraw();
                 }
             }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                let win = self.window.clone();
+                if let Some(win) = win {
+                    let inner_size = win.inner_size();
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.resize(inner_size.width, inner_size.height);
+                    }
+                    self.update_grid_size();
+                    win.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 let tab_infos = self.tab_info_list();
                 let active_idx = self.active_tab_index;
@@ -1327,15 +1655,37 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                     KeyEvent {
                         logical_key,
                         text,
-                        state: ElementState::Pressed,
+                        state: key_state,
+                        repeat,
                         ..
                     },
                 ..
             } => {
+                let event_type = match key_state {
+                    ElementState::Pressed => {
+                        if repeat {
+                            2u8 // Repeat
+                        } else {
+                            1u8 // Press
+                        }
+                    }
+                    ElementState::Released => 3u8, // Release
+                };
+
+                let active_kb_flags = self
+                    .active_tab()
+                    .and_then(|t| t.active_pane())
+                    .map(|p| p.parser.keyboard_flags)
+                    .unwrap_or(0);
+
+                if key_state == ElementState::Released && (active_kb_flags & 2 == 0) {
+                    return;
+                }
+
                 // Eğer süreç sonlanmış ve hold modundaysa, herhangi bir tuşa basılınca sekmeyi kapat
                 if let Some(tab) = self.tabs.get(self.active_tab_index) {
                     if let Some(pane) = tab.active_pane() {
-                        if pane.is_held {
+                        if pane.is_held && key_state == ElementState::Pressed {
                             self.close_active_pane(event_loop);
                             return;
                         }
@@ -1833,169 +2183,27 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                     }
                 }
 
-                // 8.5. Kitty Klavye Protokolü (CSI u Modu)
-                if let Some(tab) = self.active_tab() {
-                    if let Some(pane) = tab.active_pane() {
-                        if pane.parser.keyboard_flags > 0 {
-                            let mut mod_mask = 0u32;
-                            if is_shift { mod_mask |= 1; }
-                            if is_alt { mod_mask |= 2; }
-                            if is_ctrl { mod_mask |= 4; }
-
-                            let modifier_param = mod_mask + 1;
-
-                            let codepoint_opt = match &logical_key {
-                                Key::Named(NamedKey::Enter) => Some(13u32),
-                                Key::Named(NamedKey::Tab) => Some(9u32),
-                                Key::Named(NamedKey::Backspace) => Some(127u32),
-                                Key::Named(NamedKey::Escape) => Some(27u32),
-                                Key::Named(NamedKey::Space) if is_ctrl || is_alt => Some(32u32),
-                                Key::Character(c) if is_ctrl || is_alt => {
-                                    c.chars().next().map(|ch| ch as u32)
-                                }
-                                _ => None,
-                            };
-
-                            if let Some(cp) = codepoint_opt {
-                                if mod_mask > 0 || cp == 13 || cp == 9 || cp == 127 || cp == 27 {
-                                    let seq = format!("\x1b[{};{}u", cp, modifier_param);
-                                    let _ = pane.pty.write_bytes(seq.as_bytes());
-                                    if let Some(win) = &self.window {
-                                        win.request_redraw();
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-
                 let app_cursor = self
                     .active_tab()
                     .and_then(|t| t.active_pane())
                     .map(|p| p.parser.app_cursor_keys)
                     .unwrap_or(false);
+                let keyboard_flags = self
+                    .active_tab()
+                    .and_then(|t| t.active_pane())
+                    .map(|p| p.parser.keyboard_flags)
+                    .unwrap_or(0);
 
-                // 9. Özel Tuşlar (Oklar, Fonksiyon Tuşları, Home/End, Backspace, Enter, Boşluk vb.)
-                let bytes: Option<Vec<u8>> = match &logical_key {
-                    Key::Named(NamedKey::Space) => Some(vec![b' ']),
-                    Key::Named(NamedKey::Enter) => Some(vec![b'\r']),
-                    Key::Named(NamedKey::Backspace) => Some(vec![0x7f]),
-                    Key::Named(NamedKey::Tab) => {
-                        if is_shift {
-                            Some(vec![0x1b, b'[', b'Z'])
-                        } else {
-                            Some(vec![b'\t'])
-                        }
-                    }
-                    Key::Named(NamedKey::Escape) => Some(vec![0x1b]),
-                    Key::Named(NamedKey::Delete) => Some(vec![0x1b, b'[', b'3', b'~']),
-                    Key::Named(NamedKey::Insert) => Some(vec![0x1b, b'[', b'2', b'~']),
-                    Key::Named(NamedKey::Home) => {
-                        if app_cursor {
-                            Some(b"\x1bOH".to_vec())
-                        } else {
-                            Some(b"\x1b[H".to_vec())
-                        }
-                    }
-                    Key::Named(NamedKey::End) => {
-                        if app_cursor {
-                            Some(b"\x1bOF".to_vec())
-                        } else {
-                            Some(b"\x1b[F".to_vec())
-                        }
-                    }
-                    Key::Named(NamedKey::PageUp) => Some(vec![0x1b, b'[', b'5', b'~']),
-                    Key::Named(NamedKey::PageDown) => Some(vec![0x1b, b'[', b'6', b'~']),
-
-                    Key::Named(NamedKey::ArrowUp) => {
-                        if is_ctrl {
-                            Some(b"\x1b[1;5A".to_vec())
-                        } else if is_alt {
-                            Some(b"\x1b[1;3A".to_vec())
-                        } else if is_shift {
-                            Some(b"\x1b[1;2A".to_vec())
-                        } else if app_cursor {
-                            Some(b"\x1bOA".to_vec())
-                        } else {
-                            Some(b"\x1b[A".to_vec())
-                        }
-                    }
-                    Key::Named(NamedKey::ArrowDown) => {
-                        if is_ctrl {
-                            Some(b"\x1b[1;5B".to_vec())
-                        } else if is_alt {
-                            Some(b"\x1b[1;3B".to_vec())
-                        } else if is_shift {
-                            Some(b"\x1b[1;2B".to_vec())
-                        } else if app_cursor {
-                            Some(b"\x1bOB".to_vec())
-                        } else {
-                            Some(b"\x1b[B".to_vec())
-                        }
-                    }
-                    Key::Named(NamedKey::ArrowRight) => {
-                        if is_ctrl {
-                            Some(b"\x1b[1;5C".to_vec())
-                        } else if is_alt {
-                            Some(b"\x1b[1;3C".to_vec())
-                        } else if is_shift {
-                            Some(b"\x1b[1;2C".to_vec())
-                        } else if app_cursor {
-                            Some(b"\x1bOC".to_vec())
-                        } else {
-                            Some(b"\x1b[C".to_vec())
-                        }
-                    }
-                    Key::Named(NamedKey::ArrowLeft) => {
-                        if is_ctrl {
-                            Some(b"\x1b[1;5D".to_vec())
-                        } else if is_alt {
-                            Some(b"\x1b[1;3D".to_vec())
-                        } else if is_shift {
-                            Some(b"\x1b[1;2D".to_vec())
-                        } else if app_cursor {
-                            Some(b"\x1bOD".to_vec())
-                        } else {
-                            Some(b"\x1b[D".to_vec())
-                        }
-                    }
-
-                    Key::Named(NamedKey::F1) => Some(b"\x1bOP".to_vec()),
-                    Key::Named(NamedKey::F2) => Some(b"\x1bOQ".to_vec()),
-                    Key::Named(NamedKey::F3) => Some(b"\x1bOR".to_vec()),
-                    Key::Named(NamedKey::F4) => Some(b"\x1bOS".to_vec()),
-                    Key::Named(NamedKey::F5) => Some(b"\x1b[15~".to_vec()),
-                    Key::Named(NamedKey::F6) => Some(b"\x1b[17~".to_vec()),
-                    Key::Named(NamedKey::F7) => Some(b"\x1b[18~".to_vec()),
-                    Key::Named(NamedKey::F8) => Some(b"\x1b[19~".to_vec()),
-                    Key::Named(NamedKey::F9) => Some(b"\x1b[20~".to_vec()),
-                    Key::Named(NamedKey::F10) => Some(b"\x1b[21~".to_vec()),
-                    Key::Named(NamedKey::F11) => Some(b"\x1b[23~".to_vec()),
-                    Key::Named(NamedKey::F12) => Some(b"\x1b[24~".to_vec()),
-
-                    _ => {
-                        if let Some(t) = text {
-                            let mut b = t.as_bytes().to_vec();
-                            if is_alt {
-                                let mut prefixed = vec![0x1b];
-                                prefixed.extend(b);
-                                b = prefixed;
-                            }
-                            Some(b)
-                        } else if let Key::Character(s) = logical_key {
-                            let mut b = s.as_bytes().to_vec();
-                            if is_alt {
-                                let mut prefixed = vec![0x1b];
-                                prefixed.extend(b);
-                                b = prefixed;
-                            }
-                            Some(b)
-                        } else {
-                            None
-                        }
-                    }
-                };
+                let bytes = encode_key_event(
+                    &logical_key,
+                    text.as_deref(),
+                    is_shift,
+                    is_ctrl,
+                    is_alt,
+                    keyboard_flags,
+                    app_cursor,
+                    event_type,
+                );
 
                 if let Some(b) = bytes {
                     if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
@@ -2148,7 +2356,11 @@ impl ApplicationHandler<AppEvent> for TerminalApp {
                 if let Some(menu) = &mut self.context_menu {
                     let screen_w = self.window.as_ref().map(|w| w.inner_size().width as f32).unwrap_or(800.0);
                     let screen_h = self.window.as_ref().map(|w| w.inner_size().height as f32).unwrap_or(600.0);
-                    let item_h = 28.0;
+                    let item_h = self
+                        .renderer
+                        .as_ref()
+                        .map(|r| r.context_menu_item_height())
+                        .unwrap_or(28.0);
                     let mw = 220.0;
                     let mh = (menu.items.len() as f32 * item_h) + 8.0;
                     let mx = menu.pos.0.min(screen_w - mw - 8.0).max(8.0);
@@ -2718,5 +2930,169 @@ mod tests {
     fn test_filter_commands_no_match() {
         let results = filter_commands_by_query("nonexistent_command_xyz");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_encode_key_event_kitty_protocol() {
+        // Flag 1 (Disambiguate): Plain Enter, Tab, Backspace modifikatörsüzken miras baytları döndürmeli (kabuk uyumluluğu)
+        let plain_enter = encode_key_event(&Key::Named(NamedKey::Enter), None, false, false, false, 1, false, 1);
+        assert_eq!(plain_enter, Some(b"\r".to_vec()));
+
+        let plain_tab = encode_key_event(&Key::Named(NamedKey::Tab), None, false, false, false, 1, false, 1);
+        assert_eq!(plain_tab, Some(b"\t".to_vec()));
+
+        let plain_bs = encode_key_event(&Key::Named(NamedKey::Backspace), None, false, false, false, 1, false, 1);
+        assert_eq!(plain_bs, Some(vec![0x7f]));
+
+        // Plain Escape -> \x1b[27u (default modifier 1 atlanır)
+        let plain_esc = encode_key_event(&Key::Named(NamedKey::Escape), None, false, false, false, 1, false, 1);
+        assert_eq!(plain_esc, Some(b"\x1b[27u".to_vec()));
+
+        let ctrl_esc = encode_key_event(&Key::Named(NamedKey::Escape), None, false, true, false, 1, false, 1);
+        assert_eq!(ctrl_esc, Some(b"\x1b[27;5u".to_vec()));
+
+        // Shift+Harf tek başına text üretir, CSI u üretmemeli (büyük harf yazılabilmeli)
+        let shift_a_text = encode_key_event(&Key::Character("A".into()), Some("A"), true, false, false, 1, false, 1);
+        assert_eq!(shift_a_text, Some(b"A".to_vec()));
+
+        // Shift+Enter -> \x1b[13;2u
+        let enter = encode_key_event(&Key::Named(NamedKey::Enter), None, true, false, false, 1, false, 1);
+        assert_eq!(enter, Some(b"\x1b[13;2u".to_vec()));
+
+        // Ctrl+Enter -> \x1b[13;5u
+        let ctrl_enter = encode_key_event(&Key::Named(NamedKey::Enter), None, false, true, false, 1, false, 1);
+        assert_eq!(ctrl_enter, Some(b"\x1b[13;5u".to_vec()));
+
+        // Ctrl+Tab -> \x1b[9;5u
+        let tab = encode_key_event(&Key::Named(NamedKey::Tab), None, false, true, false, 1, false, 1);
+        assert_eq!(tab, Some(b"\x1b[9;5u".to_vec()));
+
+        // Shift+Tab -> \x1b[9;2u
+        let shift_tab = encode_key_event(&Key::Named(NamedKey::Tab), None, true, false, false, 1, false, 1);
+        assert_eq!(shift_tab, Some(b"\x1b[9;2u".to_vec()));
+
+        // Ctrl+Backspace -> \x1b[127;5u
+        let bs = encode_key_event(&Key::Named(NamedKey::Backspace), None, false, true, false, 1, false, 1);
+        assert_eq!(bs, Some(b"\x1b[127;5u".to_vec()));
+
+        // Ctrl+Space -> \x1b[32;5u
+        let space = encode_key_event(&Key::Named(NamedKey::Space), None, false, true, false, 1, false, 1);
+        assert_eq!(space, Some(b"\x1b[32;5u".to_vec()));
+
+        // Shift+Space -> \x1b[32;2u
+        let shift_space = encode_key_event(&Key::Named(NamedKey::Space), None, true, false, false, 1, false, 1);
+        assert_eq!(shift_space, Some(b"\x1b[32;2u".to_vec()));
+
+        // Ctrl+Shift+Space -> \x1b[32;6u
+        let ctrl_shift_space = encode_key_event(&Key::Named(NamedKey::Space), None, true, true, false, 1, false, 1);
+        assert_eq!(ctrl_shift_space, Some(b"\x1b[32;6u".to_vec()));
+
+        // Ctrl+a -> \x1b[97;5u
+        let ctrl_a = encode_key_event(&Key::Character("a".into()), None, false, true, false, 1, false, 1);
+        assert_eq!(ctrl_a, Some(b"\x1b[97;5u".to_vec()));
+
+        // Ctrl+Shift+a (büyük A karakteri gelse bile küçük harf codepoint olmalı) -> \x1b[97;6u
+        let ctrl_shift_a = encode_key_event(&Key::Character("A".into()), None, true, true, false, 1, false, 1);
+        assert_eq!(ctrl_shift_a, Some(b"\x1b[97;6u".to_vec()));
+
+        // Alt+b -> \x1b[98;3u
+        let alt_b = encode_key_event(&Key::Character("b".into()), None, false, false, true, 1, false, 1);
+        assert_eq!(alt_b, Some(b"\x1b[98;3u".to_vec()));
+
+        // Ctrl+Alt+z -> \x1b[122;7u
+        let ctrl_alt_z = encode_key_event(&Key::Character("z".into()), None, false, true, true, 1, false, 1);
+        assert_eq!(ctrl_alt_z, Some(b"\x1b[122;7u".to_vec()));
+
+        // Flag 8 (Report All Keys): Düz tuşlar da CSI u ile bildirilmeli
+        let all_enter = encode_key_event(&Key::Named(NamedKey::Enter), None, false, false, false, 8, false, 1);
+        assert_eq!(all_enter, Some(b"\x1b[13u".to_vec()));
+
+        let all_a = encode_key_event(&Key::Character("a".into()), Some("a"), false, false, false, 8, false, 1);
+        assert_eq!(all_a, Some(b"\x1b[97u".to_vec()));
+
+        // Flag 2 (Report Event Types): Release (:3) ve Repeat (:2)
+        let release_enter = encode_key_event(&Key::Named(NamedKey::Enter), None, false, false, false, 2, false, 3);
+        assert_eq!(release_enter, Some(b"\x1b[13;1:3u".to_vec()));
+
+        let repeat_a = encode_key_event(&Key::Character("a".into()), Some("a"), false, false, false, 2, false, 2);
+        assert_eq!(repeat_a, Some(b"\x1b[97;1:2u".to_vec()));
+
+        let release_ctrl_a = encode_key_event(&Key::Character("a".into()), None, false, true, false, 2, false, 3);
+        assert_eq!(release_ctrl_a, Some(b"\x1b[97;5:3u".to_vec()));
+    }
+
+    #[test]
+    fn test_encode_key_event_arrows_and_functional_keys() {
+        // Normal ok tuşu
+        let up = encode_key_event(&Key::Named(NamedKey::ArrowUp), None, false, false, false, 0, false, 1);
+        assert_eq!(up, Some(b"\x1b[A".to_vec()));
+
+        let up_app = encode_key_event(&Key::Named(NamedKey::ArrowUp), None, false, false, false, 0, true, 1);
+        assert_eq!(up_app, Some(b"\x1bOA".to_vec()));
+
+        // Shift+Up -> 1;2A
+        let shift_up = encode_key_event(&Key::Named(NamedKey::ArrowUp), None, true, false, false, 0, false, 1);
+        assert_eq!(shift_up, Some(b"\x1b[1;2A".to_vec()));
+
+        // Alt+Up -> 1;3A
+        let alt_up = encode_key_event(&Key::Named(NamedKey::ArrowUp), None, false, false, true, 0, false, 1);
+        assert_eq!(alt_up, Some(b"\x1b[1;3A".to_vec()));
+
+        // Shift+Alt+Up -> 1;4A
+        let shift_alt_up = encode_key_event(&Key::Named(NamedKey::ArrowUp), None, true, false, true, 0, false, 1);
+        assert_eq!(shift_alt_up, Some(b"\x1b[1;4A".to_vec()));
+
+        // Ctrl+Up -> 1;5A
+        let ctrl_up = encode_key_event(&Key::Named(NamedKey::ArrowUp), None, false, true, false, 0, false, 1);
+        assert_eq!(ctrl_up, Some(b"\x1b[1;5A".to_vec()));
+
+        // Ctrl+Shift+Up -> 1;6A
+        let ctrl_shift_up = encode_key_event(&Key::Named(NamedKey::ArrowUp), None, true, true, false, 0, false, 1);
+        assert_eq!(ctrl_shift_up, Some(b"\x1b[1;6A".to_vec()));
+
+        // Ctrl+Alt+Up -> 1;7A
+        let ctrl_alt_up = encode_key_event(&Key::Named(NamedKey::ArrowUp), None, false, true, true, 0, false, 1);
+        assert_eq!(ctrl_alt_up, Some(b"\x1b[1;7A".to_vec()));
+
+        // Ctrl+Alt+Shift+Up -> 1;8A
+        let all_mods = encode_key_event(&Key::Named(NamedKey::ArrowUp), None, true, true, true, 0, false, 1);
+        assert_eq!(all_mods, Some(b"\x1b[1;8A".to_vec()));
+
+        // Diğer yön okları
+        let ctrl_down = encode_key_event(&Key::Named(NamedKey::ArrowDown), None, false, true, false, 0, false, 1);
+        assert_eq!(ctrl_down, Some(b"\x1b[1;5B".to_vec()));
+
+        let ctrl_right = encode_key_event(&Key::Named(NamedKey::ArrowRight), None, false, true, false, 0, false, 1);
+        assert_eq!(ctrl_right, Some(b"\x1b[1;5C".to_vec()));
+
+        let ctrl_left = encode_key_event(&Key::Named(NamedKey::ArrowLeft), None, false, true, false, 0, false, 1);
+        assert_eq!(ctrl_left, Some(b"\x1b[1;5D".to_vec()));
+
+        // Home ve End
+        let ctrl_home = encode_key_event(&Key::Named(NamedKey::Home), None, false, true, false, 0, false, 1);
+        assert_eq!(ctrl_home, Some(b"\x1b[1;5H".to_vec()));
+
+        let ctrl_end = encode_key_event(&Key::Named(NamedKey::End), None, false, true, false, 0, false, 1);
+        assert_eq!(ctrl_end, Some(b"\x1b[1;5F".to_vec()));
+
+        // Delete, Insert, PageUp, PageDown
+        let ctrl_del = encode_key_event(&Key::Named(NamedKey::Delete), None, false, true, false, 0, false, 1);
+        assert_eq!(ctrl_del, Some(b"\x1b[3;5~".to_vec()));
+
+        let ctrl_ins = encode_key_event(&Key::Named(NamedKey::Insert), None, false, true, false, 0, false, 1);
+        assert_eq!(ctrl_ins, Some(b"\x1b[2;5~".to_vec()));
+
+        let ctrl_pgup = encode_key_event(&Key::Named(NamedKey::PageUp), None, false, true, false, 0, false, 1);
+        assert_eq!(ctrl_pgup, Some(b"\x1b[5;5~".to_vec()));
+
+        let ctrl_pgdn = encode_key_event(&Key::Named(NamedKey::PageDown), None, false, true, false, 0, false, 1);
+        assert_eq!(ctrl_pgdn, Some(b"\x1b[6;5~".to_vec()));
+
+        // Fonksiyon Tuşları
+        let ctrl_f1 = encode_key_event(&Key::Named(NamedKey::F1), None, false, true, false, 0, false, 1);
+        assert_eq!(ctrl_f1, Some(b"\x1b[1;5P".to_vec()));
+
+        let ctrl_f5 = encode_key_event(&Key::Named(NamedKey::F5), None, false, true, false, 0, false, 1);
+        assert_eq!(ctrl_f5, Some(b"\x1b[15;5~".to_vec()));
     }
 }
